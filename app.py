@@ -135,11 +135,20 @@ def classify_action(조치):
     return '기타'
 
 def parse_workers(조치자_val):
-    """조치자 문자열 → 개인 리스트"""
+    """조치자 문자열 → 개인 리스트
+    구분자: , / . 공백 줄바꿈 + 모두 처리
+    조합 문자열 자체는 선택지에 노출되지 않음"""
+    NOISE = {'야간', '주간', '주간조', '야간조', '주야간', '업체', '가동중', '조치', '기타'}
     if not 조치자_val or not isinstance(조치자_val, str):
         return []
-    workers = [w.strip() for w in re.split('[,/]+', 조치자_val) if w.strip()]
-    return [w for w in workers if len(w) >= 2]  # 1자 잡음 제거
+    # 구분자: 콤마, 슬래시, 마침표, 공백, 줄바꿈, + 모두 처리
+    workers = [w.strip() for w in re.split(r'[,/.\s\+]+', 조치자_val) if w.strip()]
+    workers = [w for w in workers if len(w) >= 2]
+    # 한글 포함된 이름만 유효 (숫자/영문만인 잡음 제거)
+    workers = [w for w in workers if re.search(r'[가-힣]', w)]
+    # 잡음 단어 제거
+    workers = [w for w in workers if w not in NOISE]
+    return workers
 
 # ─────────────────────────────────────────────────────
 # ★ 로봇/지그 세부분류 함수
@@ -1309,7 +1318,7 @@ with tab4:
                       .reset_index())
         person_agg['평균소요시간_분'] = (person_agg['총소요시간_분'] / person_agg['출동건수']).round(1)
         person_agg['총소요시간_시'] = (person_agg['총소요시간_분'] / 60).round(1)
-        person_agg = person_agg[person_agg['출동건수'] >= 5].sort_values('출동건수', ascending=False)
+        person_agg = person_agg[person_agg['출동건수'] >= 1].sort_values('출동건수', ascending=False)
 
         if person_agg.empty:
             st.warning("5건 이상 출동 인원이 없습니다.")
@@ -1357,7 +1366,7 @@ with tab4:
                     f'— 실제 근무시간 포함 시 52시간 초과 위험</div>',
                     unsafe_allow_html=True)
 
-            top_workers = person_agg.head(10)['조치자'].tolist()
+            top_workers = person_agg['조치자'].tolist()
             sel_w = st.selectbox("인원 선택 (주별 차트)", top_workers, key='t4w')
             w_data = weekly[weekly['조치자'] == sel_w].copy()
             w_data['년주'] = (w_data['연도'].astype(str) + '-W' +
