@@ -1281,7 +1281,7 @@ with tab3:
         st.info("Tab1에서 데이터를 불러오고 '통합 실행'을 눌러주세요.")
     else:
         st.subheader("설비 MTTR / MTBF 분석")
-        st.caption("⚠️ MTBF는 근사값입니다 — 월~토 일15시간 가동 적용")
+        st.caption("⚠️ MTBF는 근사값입니다 — 월~토요일 15시간 가동 적용")
 
         # 전역 기간 필터 적용
         mf1, mf2, mf3 = st.columns([3, 2, 1])
