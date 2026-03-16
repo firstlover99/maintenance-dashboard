@@ -191,11 +191,33 @@ def classify_bm_pm(row):
 def parse_workers(조치자_val):
     NOISE = {'야간','주간','주간조','야간조','주야간','업체','가동중','조치','기타'}
     if not 조치자_val or not isinstance(조치자_val, str): return []
-    workers = [w.strip() for w in re.split(r'[,/.\s\+]+', 조치자_val) if w.strip()]
-    workers = [w for w in workers if len(w) >= 2]
+    workers = [w.strip() for w in re.split(r'[,/.\+]+', 조치자_val) if w.strip()]
+    # 공백 단독 구분 케이스: 분리 후 한글 2자 이상 토큰만 추출
+    expanded = []
+    for w in workers:
+        sub = [s.strip() for s in w.split() if s.strip()]
+        # 한글 포함 2자 이상 토큰이 2개 이상이면 공백이 구분자인 것으로 판단
+        korean_tokens = [s for s in sub if len(s) >= 2 and re.search(r'[가-힣]', s)]
+        if len(korean_tokens) >= 2:
+            expanded.extend(korean_tokens)
+        else:
+            expanded.append(w)
+    workers = [w for w in expanded if len(w) >= 2]
     workers = [w for w in workers if re.search(r'[가-힣]', w)]
     workers = [w for w in workers if w not in NOISE]
     return workers
+
+
+def parse_workers_with_type(조치자_val):
+    """
+    조치자 파싱 + 출동유형(단독/협업) + 인원수 반환
+    반환: (workers_list, 출동유형, 인원수)
+    """
+    workers = parse_workers(조치자_val)
+    cnt = len(workers)
+    if cnt == 0:   return [], '미상', 0
+    if cnt == 1:   return workers, '단독', 1
+    return workers, '협업', cnt
 
 def get_세부분류(row):
     유형 = str(row.get('설비유형') or '').strip()
@@ -235,7 +257,8 @@ def get_고장부위_그룹(v):
 def calc_recurrence(df, window_days=90):
     """
     동일 설비_KEY + 동일 고장부위 기준으로
-    이전 발생 후 window_days 내 재발 여부를 판정.
+    완료시각 → 다음 건 출동시각 간격(분) 기준 재발 판정.
+    완료/출동시각 없으면 발생일시 fallback.
     반환: 재발여부(bool) Series
     """
     df = df.sort_values('발생일시').copy()
@@ -243,13 +266,89 @@ def calc_recurrence(df, window_days=90):
     df['재발KEY'] = df['설비_KEY'].astype(str) + '||' + df['고장부위'].fillna('').astype(str)
     for key, grp in df.groupby('재발KEY'):
         idx = grp.index.tolist()
-        dts = grp['발생일시'].tolist()
         for i in range(1, len(idx)):
-            if dts[i] and dts[i-1]:
-                gap = (dts[i] - dts[i-1]).days
-                if 0 < gap <= window_days:
-                    df.loc[idx[i], '재발여부_계산'] = True
+            # 이전 건 완료시각, 다음 건 출동시각 우선
+            prev_end = grp.loc[idx[i-1], '완료시각'] if '완료시각' in grp.columns else None
+            next_start = grp.loc[idx[i], '출동시각'] if '출동시각' in grp.columns else None
+            # fallback: 발생일시 사용
+            if prev_end is None or pd.isna(prev_end):
+                prev_end = grp.loc[idx[i-1], '발생일시']
+            if next_start is None or pd.isna(next_start):
+                next_start = grp.loc[idx[i], '발생일시']
+            if prev_end and next_start:
+                try:
+                    gap_days = (next_start - prev_end).total_seconds() / 86400
+                    if 0 <= gap_days <= window_days:
+                        df.loc[idx[i], '재발여부_계산'] = True
+                except:
+                    pass
     return df['재발여부_계산']
+
+
+# ── 고장 클러스터링 함수 ─────────────────────────────
+def cluster_faults(grp, cluster_min=60):
+    """
+    동일 설비_KEY 그룹 내에서
+    이전 건 완료시각 ~ 다음 건 출동시각 간격이 cluster_min 이내이면
+    동일 고장으로 통합. BM(돌발) 건만 대상.
+    반환: 클러스터링된 DataFrame (건수 감소, 수리시간 합산)
+    """
+    grp = grp.sort_values('발생일시').copy()
+    clusters = []
+    current = None
+    for _, row in grp.iterrows():
+        if current is None:
+            current = row.copy()
+            current['_cluster_count'] = 1
+            continue
+        # 이전 완료 ~ 현재 출동 간격 계산 (분)
+        prev_end   = current.get('완료시각')
+        next_start = row.get('출동시각')
+        if prev_end is None or pd.isna(prev_end):
+            prev_end = current.get('발생일시')
+        if next_start is None or pd.isna(next_start):
+            next_start = row.get('발생일시')
+        gap_min = None
+        if prev_end is not None and next_start is not None:
+            try:
+                gap_min = (next_start - prev_end).total_seconds() / 60
+            except:
+                gap_min = None
+        if gap_min is not None and 0 <= gap_min <= cluster_min:
+            # 동일 고장 — 수리시간 합산, 완료시각 갱신
+            cur_mtr = current.get('소요시간') or 0
+            row_mtr = row.get('소요시간') or 0
+            current['소요시간'] = cur_mtr + row_mtr
+            if row.get('완료시각') and not pd.isna(row.get('완료시각')):
+                current['완료시각'] = row['완료시각']
+            current['_cluster_count'] = current.get('_cluster_count', 1) + 1
+        else:
+            clusters.append(current)
+            current = row.copy()
+            current['_cluster_count'] = 1
+    if current is not None:
+        clusters.append(current)
+    result = pd.DataFrame(clusters)
+    if '_cluster_count' not in result.columns:
+        result['_cluster_count'] = 1
+    return result
+
+
+# ── 분석기간 내 월~토 가동시간 계산 (방법 B) ───────────
+def calc_worktime_hours(start_dt, end_dt, daily_hours=15.0):
+    """
+    start_dt ~ end_dt 기간 중 월~토(일요일 제외) 일수 × daily_hours
+    반환: 근무가동시간(시간, float)
+    """
+    if start_dt is None or end_dt is None:
+        return 0.0
+    total_days = (end_dt.date() - start_dt.date()).days + 1
+    # 일요일(weekday==6) 제외
+    work_days = sum(
+        1 for i in range(total_days)
+        if (start_dt.date() + pd.Timedelta(days=i)).weekday() != 6
+    )
+    return work_days * daily_hours
 
 # ══════════════════════════════════════════════════════
 # 파일 로드
@@ -454,38 +553,119 @@ def load_from_gdrive(url):
 # ══════════════════════════════════════════════════════
 # 분석 함수
 # ══════════════════════════════════════════════════════
-def calc_mttr_mtbf(df):
+def calc_mttr_mtbf(df, cluster_min=60):
+    """
+    근사 MTBF 계산 (방법 B):
+      - BM(돌발) 건만 MTBF 계산 대상
+      - 클러스터링: 완료시각~출동시각 gap <= cluster_min 분이면 동일 고장 통합
+      - 근사 MTBF = (분석기간 월~토 가동시간h - 설비별 총수리시간h) ÷ 클러스터 건수
+      - 0h 건(출동=완료 또는 수리시간 0) 분리 처리
+    """
     results = []
+    quality_issues = []  # 데이터 품질 문제 건
+
     df2 = df[df['소요시간'].notna()].copy()
+
+    # 분석기간 계산 (전체 데이터 기준)
+    valid_dt = df2['발생일시'].dropna()
+    if valid_dt.empty:
+        return pd.DataFrame(results), pd.DataFrame(quality_issues)
+    period_start = valid_dt.min()
+    period_end   = valid_dt.max()
+    total_work_h = calc_worktime_hours(period_start, period_end, daily_hours=15.0)
+
     for key, grp in df2.groupby('설비_KEY'):
-        grp = grp.sort_values('발생일시')
+        grp = grp.sort_values('발생일시').copy()
         parts = key.split(' | ')
-        라인 = parts[0] if len(parts)>0 else ''
-        설비 = parts[1] if len(parts)>1 else ''
-        mttr = grp['소요시간'].mean()
-        cnt = len(grp)
-        if cnt >= 2:
-            gaps = grp['발생일시'].diff().dropna().dt.total_seconds()/3600
-            gaps = gaps[gaps>0]
-            mtbf = gaps.mean() if len(gaps) else None
+        라인 = parts[0] if len(parts) > 0 else ''
+        설비 = parts[1] if len(parts) > 1 else ''
+        유형 = grp['설비유형'].mode()[0] if not grp['설비유형'].isna().all() else ''
+
+        # ── 데이터 품질 체크 ──
+        zero_dur = grp[grp['소요시간'] <= 0]
+        no_time  = grp[grp['출동시각'].isna() | grp['완료시각'].isna()] if '출동시각' in grp.columns else pd.DataFrame()
+        if not zero_dur.empty:
+            quality_issues.append({
+                '설비_KEY': key, '설비유형': 유형,
+                '문제유형': '수리시간 0 이하',
+                '건수': len(zero_dur),
+                '비고': '출동시각=완료시각 또는 입력 오류 의심'
+            })
+        if not no_time.empty:
+            quality_issues.append({
+                '설비_KEY': key, '설비유형': 유형,
+                '문제유형': '출동/완료시각 없음',
+                '건수': len(no_time),
+                '비고': 'MTBF 계산 정확도 저하 가능'
+            })
+
+        # ── 전체 건 집계 (PM+BM 합산) ──
+        total_cnt  = len(grp)
+        total_stop = grp['소요시간'].sum()
+        total_mttr = grp['소요시간'].mean()
+
+        # ── BM(돌발) 건만 MTBF 계산 ──
+        if '보전구분' in grp.columns:
+            bm_grp = grp[grp['보전구분'] == 'BM(돌발)'].copy()
         else:
-            mtbf = None
-        results.append({'라인':라인,'고장설비':설비,'설비_KEY':key,'발생건수':cnt,
-                        'MTTR(분)':round(mttr,1),
-                        'MTBF(시간)':round(mtbf,1) if mtbf else None,
-                        '총정지시간(분)':round(grp['소요시간'].sum(),1),
-                        '설비유형':grp['설비유형'].mode()[0] if not grp['설비유형'].isna().all() else ''})
-    return pd.DataFrame(results).sort_values('총정지시간(분)', ascending=False)
+            bm_grp = grp.copy()
+
+        mtbf_근사 = None
+        cluster_cnt = None
+
+        if len(bm_grp) >= 2:
+            # 클러스터링 적용
+            clustered = cluster_faults(bm_grp, cluster_min=cluster_min)
+            cluster_cnt = len(clustered)
+            # 설비별 총수리시간(시간)
+            equip_repair_h = clustered['소요시간'].sum() / 60.0
+            # 근사 MTBF = (전체가동시간 - 수리시간) / 클러스터건수
+            avail_h = max(total_work_h - equip_repair_h, 0)
+            if cluster_cnt > 0:
+                mtbf_근사 = round(avail_h / cluster_cnt, 1)
+        elif len(bm_grp) == 1:
+            cluster_cnt = 1
+            # 건수 1건: 분석기간 전체를 1건으로 나눔 (상한으로 표시)
+            equip_repair_h = bm_grp['소요시간'].sum() / 60.0
+            avail_h = max(total_work_h - equip_repair_h, 0)
+            mtbf_근사 = round(avail_h, 1)  # 건수 1이므로 / 1
+
+        results.append({
+            '라인': 라인,
+            '고장설비': 설비,
+            '설비_KEY': key,
+            '설비유형': 유형,
+            '전체건수': total_cnt,
+            'BM건수': len(bm_grp),
+            '클러스터건수(BM)': cluster_cnt,
+            'MTTR(분)': round(total_mttr, 1),
+            'MTBF_근사(시간)': mtbf_근사,
+            '총정지시간(분)': round(total_stop, 1),
+            '분석기간_가동시간(h)': round(total_work_h, 1),
+        })
+
+    result_df = pd.DataFrame(results).sort_values('총정지시간(분)', ascending=False)
+    quality_df = pd.DataFrame(quality_issues)
+    return result_df, quality_df
 
 def get_worker_df(df):
     rows = []
     for _, r in df.iterrows():
-        for w in parse_workers(r.get('조치자')):
-            rows.append({'조치자':w,
-                         '소요시간':r['소요시간'] if pd.notna(r.get('소요시간')) else 0,
-                         '발생일시':r['발생일시'],'라인':r.get('라인'),
-                         '라인_차종':r.get('라인_차종',r.get('라인','')),
-                         '설비유형':r.get('설비유형'),'고장설비':r.get('고장설비')})
+        workers, 출동유형, 인원수 = parse_workers_with_type(r.get('조치자'))
+        for w in workers:
+            rows.append({
+                '조치자':    w,
+                '소요시간':  r['소요시간'] if pd.notna(r.get('소요시간')) else 0,
+                '발생일시':  r['발생일시'],
+                '라인':      r.get('라인'),
+                '라인_차종': r.get('라인_차종', r.get('라인', '')),
+                '설비유형':  r.get('설비유형'),
+                '고장설비':  r.get('고장설비'),
+                '출동유형':  출동유형,   # 단독 / 협업 / 미상
+                '협업인원수': 인원수,
+                '조치자_원본': str(r.get('조치자') or ''),
+                '설비_KEY':  r.get('설비_KEY', ''),
+            })
     return pd.DataFrame(rows) if rows else pd.DataFrame()
 
 def calc_response_time(df):
@@ -540,12 +720,30 @@ for k in ['press_df','robot_df','merged_df']:
     if k not in st.session_state:
         st.session_state[k] = None
 
+# 데이터 로드 완료 후 자동 rerun 플래그
+if '_just_loaded' not in st.session_state:
+    st.session_state['_just_loaded'] = False
+
 # KPI 목표값 기본값 (세션 유지)
 _KPI_DEFAULTS = {
     'kpi_target_cnt': 100, 'kpi_target_mttr': 30,
     'kpi_target_stop': 3000, 'kpi_target_mtbf': 200,
 }
 for k, v in _KPI_DEFAULTS.items():
+    if k not in st.session_state:
+        st.session_state[k] = v
+
+# 전역 필터 초기값
+_GF_DEFAULTS = {
+    'gf_mode':        '📅 연도선택',
+    'gf_years':       [],
+    'gf_year_single': None,
+    'gf_months':      [],
+    'gf_start':       None,
+    'gf_end':         None,
+    'gf_label':       '전체',
+}
+for k, v in _GF_DEFAULTS.items():
     if k not in st.session_state:
         st.session_state[k] = v
 
@@ -660,6 +858,150 @@ if _mdf is not None:
             'padding:8px 18px;border-radius:6px;margin-bottom:10px;font-size:13px;">'
             '✅ 긴급 경고 없음 — 정상 관리 중</div>', unsafe_allow_html=True)
 
+# ══════════════════════════════════════════════════════
+# 전역 기간 필터 — 모든 탭 공통 적용
+# ══════════════════════════════════════════════════════
+def apply_global_filter(df):
+    if df is None: return None
+    mode = st.session_state.get('gf_mode', '📅 연도선택')
+    if mode == '📅 연도선택':
+        yrs = st.session_state.get('gf_years', [])
+        return df[df['년'].isin(yrs)].copy() if yrs else df.copy()
+    elif mode == '📆 월선택':
+        yr  = st.session_state.get('gf_year_single')
+        mos = st.session_state.get('gf_months', [])
+        if yr and mos:
+            return df[(df['년'] == yr) & (df['월'].isin(mos))].copy()
+        return df.copy()
+    else:
+        s = st.session_state.get('gf_start')
+        e = st.session_state.get('gf_end')
+        if s and e:
+            return df[
+                (df['발생일시'].dt.date >= s) &
+                (df['발생일시'].dt.date <= e)
+            ].copy()
+        return df.copy()
+
+_mdf_raw = st.session_state.merged_df
+
+# ── 통합 완료 직후 성공 메시지 표시 (rerun 후 1회) ──────
+if st.session_state.get('_just_loaded') and _mdf_raw is not None:
+    _yr_min = int(_mdf_raw['년'].min())
+    _yr_max = int(_mdf_raw['년'].max())
+    _재발수 = int(_mdf_raw['재발여부'].sum()) if '재발여부' in _mdf_raw.columns else 0
+    st.success(
+        f"✅ 데이터 통합 완료 — {len(_mdf_raw):,}건 "
+        f"({_yr_min}~{_yr_max}년) | 재발 판정: {_재발수:,}건 "
+        f"| 전역 기간 필터가 활성화되었습니다.")
+    st.session_state['_just_loaded'] = False  # 플래그 초기화 (1회만 표시)
+
+# ── 전역 필터 초기값 세팅 (데이터 있을 때) ─────────────
+if _mdf_raw is not None:
+    _all_yrs = sorted(_mdf_raw['년'].dropna().unique().astype(int))
+    _dt_min  = _mdf_raw['발생일시'].dropna().min().date()
+    _dt_max  = _mdf_raw['발생일시'].dropna().max().date()
+    if not st.session_state['gf_years']:
+        st.session_state['gf_years'] = _all_yrs
+    if st.session_state['gf_year_single'] is None:
+        st.session_state['gf_year_single'] = _all_yrs[-1] if _all_yrs else None
+    if not st.session_state['gf_months']:
+        st.session_state['gf_months'] = list(range(1, 13))
+    if st.session_state['gf_start'] is None:
+        st.session_state['gf_start'] = _dt_min
+    if st.session_state['gf_end'] is None:
+        st.session_state['gf_end'] = _dt_max
+
+with st.expander(
+    "🗓️ 전역 기간 필터 — 모든 탭에 공통 적용",
+    expanded=(_mdf_raw is not None)
+):
+    if _mdf_raw is None:
+        st.info("📂 **TAB1 [데이터 불러오기]** 에서 파일을 업로드하고 "
+                "**[🔄 데이터 통합 실행]** 버튼을 누르면 "
+                "기간 필터가 자동으로 활성화됩니다.")
+    else:
+        # ── 한 줄 3컬럼: [기간모드] | [선택위젯] | [현재필터 설명] ──
+        _gc1, _gc2, _gc3 = st.columns([2, 4, 3])
+
+        with _gc1:
+            _gf_mode = st.radio(
+                "기간 모드",
+                ["📅 연도선택", "📆 월선택", "🗓️ 날짜범위"],
+                index=["📅 연도선택","📆 월선택","🗓️ 날짜범위"].index(
+                    st.session_state['gf_mode']),
+                horizontal=True,
+                key='_gf_mode_radio',
+            )
+            st.session_state['gf_mode'] = _gf_mode
+
+        with _gc2:
+            if _gf_mode == "📅 연도선택":
+                _sel_yrs = st.multiselect(
+                    "연도 선택", _all_yrs,
+                    default=st.session_state['gf_years'],
+                    key='_gf_years_ms',
+                )
+                st.session_state['gf_years'] = _sel_yrs
+                st.session_state['gf_label'] = (
+                    '+'.join(str(y) for y in sorted(_sel_yrs))+'년'
+                    if _sel_yrs else '전체')
+
+            elif _gf_mode == "📆 월선택":
+                _mc1, _mc2 = st.columns(2)
+                with _mc1:
+                    _sel_yr_s = st.selectbox(
+                        "연도", _all_yrs,
+                        index=_all_yrs.index(st.session_state['gf_year_single'])
+                              if st.session_state['gf_year_single'] in _all_yrs
+                              else len(_all_yrs)-1,
+                        key='_gf_yr_single',
+                    )
+                    st.session_state['gf_year_single'] = _sel_yr_s
+                with _mc2:
+                    _avail_mo = sorted(
+                        _mdf_raw[_mdf_raw['년']==_sel_yr_s]['월']
+                        .dropna().unique().astype(int))
+                    _cur_mos = [m for m in st.session_state['gf_months']
+                                if m in _avail_mo] or _avail_mo
+                    _sel_mos = st.multiselect(
+                        "월 선택", _avail_mo,
+                        default=_cur_mos,
+                        key='_gf_months_ms',
+                    )
+                    st.session_state['gf_months'] = _sel_mos
+                _mos_str = ','.join(str(m)+'월' for m in sorted(_sel_mos)) if _sel_mos else '전체'
+                st.session_state['gf_label'] = f"{_sel_yr_s}년 {_mos_str}"
+
+            else:  # 날짜범위
+                _dc1, _dc2 = st.columns(2)
+                with _dc1:
+                    _sel_start = st.date_input(
+                        "시작일", value=st.session_state['gf_start'],
+                        min_value=_dt_min, max_value=_dt_max,
+                        key='_gf_start_di',
+                    )
+                    st.session_state['gf_start'] = _sel_start
+                with _dc2:
+                    _sel_end = st.date_input(
+                        "종료일", value=st.session_state['gf_end'],
+                        min_value=_dt_min, max_value=_dt_max,
+                        key='_gf_end_di',
+                    )
+                    st.session_state['gf_end'] = _sel_end
+                st.session_state['gf_label'] = f"{_sel_start} ~ {_sel_end}"
+
+        with _gc3:
+            _gf_df  = apply_global_filter(_mdf_raw)
+            _gf_cnt = len(_gf_df) if _gf_df is not None else 0
+            _gf_pct = _gf_cnt / len(_mdf_raw) * 100 if len(_mdf_raw) > 0 else 0
+            # 컬럼 상단 여백 맞추기용 빈 레이블
+            st.markdown("&nbsp;", unsafe_allow_html=True)
+            st.markdown(
+                f"📌 **{st.session_state['gf_label']}**  \n"
+                f"적용: **{_gf_cnt:,}건** "
+                f"({_gf_pct:.1f}% / 전체 {len(_mdf_raw):,}건)")
+
 (tab1, tab2, tab3, tab4, tab5, tab6, tab7,
  tab8, tab9, tab10, tab11, tab12, tab13, tab14) = st.tabs([
     "📂 데이터 불러오기",
@@ -752,11 +1094,16 @@ with tab1:
     if st.button("🔄 데이터 통합 실행", type="primary", use_container_width=True):
         merged = merge_dfs(st.session_state.press_df, st.session_state.robot_df)
         if merged is not None:
-            st.session_state.merged_df = merged
-            yr_min = int(merged['년'].min())
-            yr_max = int(merged['년'].max())
-            재발수 = merged['재발여부'].sum() if '재발여부' in merged.columns else 0
-            st.success(f"✅ 통합 완료 — {len(merged):,}건 ({yr_min}~{yr_max}년) | 재발판정: {재발수}건")
+            st.session_state.merged_df    = merged
+            # 전역 필터 초기값 강제 리셋 (새 데이터 기준으로 재설정)
+            st.session_state['gf_years']       = []
+            st.session_state['gf_year_single'] = None
+            st.session_state['gf_months']      = []
+            st.session_state['gf_start']       = None
+            st.session_state['gf_end']         = None
+            st.session_state['gf_label']       = '전체'
+            st.session_state['_just_loaded']   = True
+            st.rerun()   # 즉시 재실행 → 전역 필터 활성화
         else:
             st.warning("불러온 데이터가 없습니다.")
 
@@ -799,21 +1146,20 @@ with tab2:
         st.subheader("고장현황 분석")
         fc1,fc2,fc3,fc4,fc5 = st.columns([2,2,2,2,1])
         with fc1:
-            yrs = sorted(df['년'].dropna().unique().astype(int))
-            sel_yr = st.multiselect("연도", yrs, default=yrs, key='t2y')
-        with fc2:
             equips = ['전체'] + sorted(df['설비유형'].dropna().unique().tolist(), key=str)
             sel_eq = st.selectbox("설비유형", equips, key='t2e')
-        with fc3:
+        with fc2:
             lines = ['전체'] + sorted(df['라인'].dropna().unique().tolist(), key=str)
             sel_ln = st.selectbox("라인", lines, key='t2l')
-        with fc4:
+        with fc3:
             cars = ['전체'] + sorted(df['차종'].dropna().unique().tolist(), key=str) if '차종' in df.columns else ['전체']
             sel_car = st.selectbox("차종", cars, key='t2car')
-        with fc5:
+        with fc4:
             top_n = st.slider("Top N", 5, 30, 20, key='t2n')
 
-        fdf = df[df['년'].isin(sel_yr)].copy() if sel_yr else df.copy()
+        fdf = apply_global_filter(df)
+        if fdf is None or fdf.empty:
+            st.warning(f"선택한 기간({st.session_state.get('gf_label','')})에 데이터가 없습니다.")
         if sel_eq  != '전체': fdf = fdf[fdf['설비유형'] == sel_eq]
         if sel_ln  != '전체': fdf = fdf[fdf['라인'] == sel_ln]
         if sel_car != '전체' and '차종' in fdf.columns: fdf = fdf[fdf['차종'] == sel_car]
@@ -897,6 +1243,7 @@ with tab2:
 
 
 # ══════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════
 # TAB 3 — 설비분석 (MTTR/MTBF)
 # ══════════════════════════════════════════════════════
 with tab3:
@@ -905,86 +1252,194 @@ with tab3:
         st.info("Tab1에서 데이터를 불러오고 '통합 실행'을 눌러주세요.")
     else:
         st.subheader("설비 MTTR / MTBF 분석")
-        mf1,mf2,mf3 = st.columns([2,2,1])
-        with mf1:
-            yrs_m = sorted(df['년'].dropna().unique().astype(int))
-            sel_yr_m = st.multiselect("연도",yrs_m,default=yrs_m,key='t3y')
-        with mf2:
-            eq_m = ['전체']+sorted(df['설비유형'].dropna().unique().tolist(),key=str)
-            sel_eq_m = st.selectbox("설비유형",eq_m,key='t3e')
-        with mf3:
-            top_m = st.slider("Top N",10,50,20,key='t3n')
+        st.caption("⚠️ MTBF는 **근사값**입니다 — 월~토 일 15시간 가동 기준, 방법B(달력 근사) 적용")
 
-        mdf = df[df['년'].isin(sel_yr_m)].copy() if sel_yr_m else df.copy()
-        if sel_eq_m != '전체': mdf = mdf[mdf['설비유형']==sel_eq_m]
-        mttr_df = calc_mttr_mtbf(mdf)
-        if mttr_df.empty:
-            st.warning("분석 가능한 데이터가 없습니다.")
+        # 전역 기간 필터 적용
+        mf1, mf2, mf3 = st.columns([3, 2, 1])
+
+        mdf = apply_global_filter(df)
+        if mdf is None: mdf = pd.DataFrame()
+
+        # ── 필터 행 2: 설비유형 + TopN + 클러스터링 ───────
+        ff1, ff2, ff3 = st.columns([2, 1, 2])
+        with ff1:
+            eq_m = ['전체'] + sorted(df['설비유형'].dropna().unique().tolist(), key=str)
+            sel_eq_m = st.selectbox("설비유형", eq_m, key='t3e')
+        with ff2:
+            top_m = st.slider("Top N", 10, 50, 20, key='t3n')
+        with ff3:
+            cluster_min_val = st.slider(
+                "클러스터링 임계값(분) — N분 이내 재발 시 동일 고장 통합",
+                min_value=30, max_value=240, value=60, step=10, key='t3_cluster')
+
+        if sel_eq_m != '전체':
+            mdf = mdf[mdf['설비유형'] == sel_eq_m]
+
+        if mdf.empty:
+            st.warning("선택한 기간/조건에 해당하는 데이터가 없습니다.")
         else:
-            mk1,mk2,mk3,mk4 = st.columns(4)
-            mk1.metric("분석 설비수",f"{len(mttr_df):,}개")
-            mk2.metric("평균 MTTR",f"{mttr_df['MTTR(분)'].mean():.1f}분")
-            mk3.metric("평균 MTBF",f"{mttr_df['MTBF(시간)'].dropna().mean():.1f}시간")
-            mk4.metric("총 정지시간",f"{mttr_df['총정지시간(분)'].sum():,.0f}분")
-            st.divider()
+            mttr_df, quality_df = calc_mttr_mtbf(mdf, cluster_min=cluster_min_val)
 
-            m_top = mttr_df.head(top_m)
-            st.markdown(f"##### MTTR 상위 {top_m}개 (평균수리시간 긴 순)")
-            fig_mttr = px.bar(m_top.sort_values('MTTR(분)'),
-                              x='MTTR(분)',y='설비_KEY',orientation='h',
-                              color='라인',
-                              custom_data=['라인','고장설비','발생건수','MTBF(시간)','총정지시간(분)','설비유형'])
-            fig_mttr.update_traces(
-                texttemplate='%{x:.0f}분',textposition='outside',
-                hovertemplate=('<b>%{y}</b><br>라인: %{customdata[0]}<br>설비: %{customdata[1]}<br>'
-                               '유형: %{customdata[5]}<br>MTTR: %{x:.1f}분<br>MTBF: %{customdata[3]}시간<br>'
-                               '발생: %{customdata[2]}건<br>총정지: %{customdata[4]:.0f}분<extra></extra>'))
-            fig_mttr.update_layout(height=max(420,len(m_top)*28),margin=dict(t=30,b=20),yaxis_title='')
-            st.plotly_chart(fig_mttr,use_container_width=True)
+            if mttr_df.empty:
+                st.warning("분석 가능한 데이터가 없습니다.")
+            else:
+                # ── KPI 지표 4개 ──────────────────────────
+                mk1, mk2, mk3, mk4 = st.columns(4)
+                mk1.metric("분석 설비수", f"{len(mttr_df):,}개")
+                mk2.metric("평균 MTTR", f"{mttr_df['MTTR(분)'].mean():.1f}분",
+                           help="출동시각~완료시각 기준 평균")
+                valid_mtbf = mttr_df['MTBF_근사(시간)'].dropna()
+                mk3.metric("평균 MTBF(근사) ⚠️",
+                           f"{valid_mtbf.mean():.1f}시간" if not valid_mtbf.empty else "N/A",
+                           help="월~토 일 15h 가동 근사값. 실가동시간 미반영으로 과대평가 가능")
+                mk4.metric("총 정지시간",
+                           f"{mttr_df['총정지시간(분)'].sum():,.0f}분",
+                           help="출동시각~완료시각 합산")
+                st.divider()
 
-            mtbf_data = mttr_df[mttr_df['MTBF(시간)'].notna()].nsmallest(top_m,'MTBF(시간)')
-            if not mtbf_data.empty:
-                st.markdown("##### MTBF 하위 — 짧을수록 잦은 고장")
-                fig_mtbf = px.bar(mtbf_data,x='MTBF(시간)',y='설비_KEY',orientation='h',color='라인',
-                                  custom_data=['라인','고장설비','발생건수','MTTR(분)','총정지시간(분)','설비유형'])
-                fig_mtbf.update_traces(
-                    texttemplate='%{x:.0f}h',textposition='outside',
-                    hovertemplate=('<b>%{y}</b><br>MTBF: %{x:.1f}시간<br>'
-                                   '발생: %{customdata[2]}건<br>MTTR: %{customdata[3]:.1f}분<extra></extra>'))
-                fig_mtbf.update_layout(height=max(420,len(mtbf_data)*28),margin=dict(t=30,b=20),yaxis_title='')
-                st.plotly_chart(fig_mtbf,use_container_width=True)
+                # ── MTTR 상위 차트 ────────────────────────
+                m_top = mttr_df.head(top_m)
+                st.markdown(f"##### MTTR 상위 {top_m}개 (평균수리시간 긴 순)")
+                fig_mttr = px.bar(
+                    m_top.sort_values('MTTR(분)'),
+                    x='MTTR(분)', y='설비_KEY', orientation='h', color='라인',
+                    custom_data=['라인', '고장설비', '전체건수', 'BM건수',
+                                 'MTBF_근사(시간)', '총정지시간(분)', '설비유형'])
+                fig_mttr.update_traces(
+                    texttemplate='%{x:.0f}분', textposition='outside',
+                    hovertemplate=(
+                        '<b>%{y}</b><br>유형: %{customdata[6]}<br>'
+                        'MTTR: %{x:.1f}분<br>MTBF(근사): %{customdata[4]}시간<br>'
+                        '전체: %{customdata[2]}건 / BM: %{customdata[3]}건<br>'
+                        '총정지: %{customdata[5]:.0f}분<extra></extra>'))
+                fig_mttr.update_layout(
+                    height=max(420, len(m_top)*28),
+                    margin=dict(t=30, b=20), yaxis_title='')
+                st.plotly_chart(fig_mttr, use_container_width=True)
 
-            st.markdown("##### MTTR vs MTBF 산점도")
-            scatter_d = mttr_df[mttr_df['MTBF(시간)'].notna()].copy()
-            if not scatter_d.empty:
-                fig_sc = px.scatter(scatter_d,x='MTBF(시간)',y='MTTR(분)',
-                                    color='라인',size='발생건수',hover_name='설비_KEY',
-                                    custom_data=['라인','고장설비','발생건수','총정지시간(분)','설비유형'],
-                                    labels={'MTBF(시간)':'MTBF(시간, 길수록 안전)','MTTR(분)':'MTTR(분, 낮을수록 좋음)'})
-                mtbf_med = scatter_d['MTBF(시간)'].median()
-                mttr_med = scatter_d['MTTR(분)'].median()
-                fig_sc.add_vline(x=mtbf_med,line_dash='dash',line_color='gray',annotation_text=f'MTBF 중앙값 {mtbf_med:.0f}h')
-                fig_sc.add_hline(y=mttr_med,line_dash='dash',line_color='gray',annotation_text=f'MTTR 중앙값 {mttr_med:.0f}분')
-                fig_sc.update_layout(height=460,margin=dict(t=30,b=20))
-                st.plotly_chart(fig_sc,use_container_width=True)
+                # ── MTBF 하위 차트 (색상 구분) ────────────
+                mtbf_data = mttr_df[mttr_df['MTBF_근사(시간)'].notna()].nsmallest(
+                    top_m, 'MTBF_근사(시간)')
+                if not mtbf_data.empty:
+                    st.markdown("##### MTBF(근사) 하위 — 짧을수록 잦은 고장")
+                    st.caption(
+                        "🔴 1시간 미만: 데이터 확인 필요 | "
+                        "🟠 1~10시간: 위험 | 🟢 10시간 초과: 양호")
 
-            resp = calc_response_time(mdf)
-            if resp is not None and not resp.empty:
-                st.markdown("##### ⏱ 응답시간 분포 (정지→출동)")
-                rc1,rc2 = st.columns(2)
-                with rc1:
-                    fig_rh = px.histogram(resp,x='응답시간_분',nbins=30,color_discrete_sequence=['#1e3a5f'])
-                    fig_rh.add_vline(x=resp['응답시간_분'].mean(),line_dash='dash',line_color='red',
-                                     annotation_text=f"평균 {resp['응답시간_분'].mean():.0f}분")
-                    fig_rh.update_layout(height=300,margin=dict(t=20,b=20))
-                    st.plotly_chart(fig_rh,use_container_width=True)
-                with rc2:
-                    fig_rb = px.box(resp,x='설비유형',y='응답시간_분',color='설비유형')
-                    fig_rb.update_layout(height=300,margin=dict(t=20,b=20),showlegend=False)
-                    st.plotly_chart(fig_rb,use_container_width=True)
+                    def _mtbf_color(h):
+                        if h is None: return '데이터없음'
+                        if h < 1:  return '🔴 데이터확인필요'
+                        if h < 10: return '🟠 위험'
+                        return '🟢 양호'
 
-            with st.expander("📋 전체 MTTR/MTBF 테이블"):
-                st.dataframe(mttr_df,use_container_width=True)
+                    mtbf_data = mtbf_data.copy()
+                    mtbf_data['MTBF등급'] = mtbf_data['MTBF_근사(시간)'].apply(_mtbf_color)
+                    color_map_mtbf = {
+                        '🔴 데이터확인필요': '#e74c3c',
+                        '🟠 위험':           '#e67e22',
+                        '🟢 양호':           '#27ae60',
+                        '데이터없음':         '#aaaaaa',
+                    }
+                    fig_mtbf = px.bar(
+                        mtbf_data, x='MTBF_근사(시간)', y='설비_KEY',
+                        orientation='h', color='MTBF등급',
+                        color_discrete_map=color_map_mtbf,
+                        custom_data=['라인', '고장설비', 'BM건수',
+                                     '클러스터건수(BM)', 'MTTR(분)', '설비유형', 'MTBF등급'])
+                    fig_mtbf.update_traces(
+                        texttemplate='%{x:.1f}h', textposition='outside',
+                        hovertemplate=(
+                            '<b>%{y}</b><br>MTBF(근사): %{x:.1f}시간<br>'
+                            '등급: %{customdata[6]}<br>'
+                            'BM건수: %{customdata[2]}건 → 클러스터: %{customdata[3]}건<br>'
+                            'MTTR: %{customdata[4]:.1f}분<extra></extra>'))
+                    fig_mtbf.update_layout(
+                        height=max(420, len(mtbf_data)*28),
+                        margin=dict(t=30, b=20), yaxis_title='',
+                        legend=dict(orientation='h', y=1.05))
+                    st.plotly_chart(fig_mtbf, use_container_width=True)
+
+                    # 1시간 미만 설비 경고 배지
+                    danger_equip = mtbf_data[mtbf_data['MTBF_근사(시간)'] < 1]
+                    if not danger_equip.empty:
+                        names = ', '.join(danger_equip['설비_KEY'].tolist()[:5])
+                        st.markdown(
+                            f'<div class="err-box">🔴 <b>MTBF 1시간 미만 설비 '
+                            f'{len(danger_equip)}개</b> — 데이터 품질 확인 또는 '
+                            f'클러스터링 임계값 조정 권장<br>'
+                            f'해당 설비: {names}{"..." if len(danger_equip)>5 else ""}'
+                            f'</div>', unsafe_allow_html=True)
+
+                # ── MTTR vs MTBF 산점도 ───────────────────
+                st.markdown("##### MTTR vs MTBF(근사) 산점도")
+                scatter_d = mttr_df[mttr_df['MTBF_근사(시간)'].notna()].copy()
+                if not scatter_d.empty:
+                    fig_sc = px.scatter(
+                        scatter_d, x='MTBF_근사(시간)', y='MTTR(분)',
+                        color='라인', size='전체건수', hover_name='설비_KEY',
+                        custom_data=['라인', '고장설비', '전체건수',
+                                     '총정지시간(분)', '설비유형'],
+                        labels={
+                            'MTBF_근사(시간)': 'MTBF 근사(시간, 길수록 안전)',
+                            'MTTR(분)': 'MTTR(분, 낮을수록 좋음)'})
+                    mtbf_med = scatter_d['MTBF_근사(시간)'].median()
+                    mttr_med = scatter_d['MTTR(분)'].median()
+                    fig_sc.add_vline(x=mtbf_med, line_dash='dash', line_color='gray',
+                                     annotation_text=f'MTBF 중앙값 {mtbf_med:.0f}h')
+                    fig_sc.add_hline(y=mttr_med, line_dash='dash', line_color='gray',
+                                     annotation_text=f'MTTR 중앙값 {mttr_med:.0f}분')
+                    fig_sc.update_layout(height=460, margin=dict(t=30, b=20))
+                    st.plotly_chart(fig_sc, use_container_width=True)
+
+                # ── 응답시간 분포 ─────────────────────────
+                resp = calc_response_time(mdf)
+                if resp is not None and not resp.empty:
+                    st.markdown("##### ⏱ 응답시간 분포 (정지→출동)")
+                    rc1, rc2 = st.columns(2)
+                    with rc1:
+                        fig_rh = px.histogram(resp, x='응답시간_분', nbins=30,
+                                              color_discrete_sequence=['#1e3a5f'])
+                        fig_rh.add_vline(
+                            x=resp['응답시간_분'].mean(), line_dash='dash',
+                            line_color='red',
+                            annotation_text=f"평균 {resp['응답시간_분'].mean():.0f}분")
+                        fig_rh.update_layout(height=300, margin=dict(t=20, b=20))
+                        st.plotly_chart(fig_rh, use_container_width=True)
+                    with rc2:
+                        fig_rb = px.box(resp, x='설비유형', y='응답시간_분',
+                                        color='설비유형')
+                        fig_rb.update_layout(height=300, margin=dict(t=20, b=20),
+                                             showlegend=False)
+                        st.plotly_chart(fig_rb, use_container_width=True)
+
+                # ── 전체 테이블 ───────────────────────────
+                with st.expander("📋 전체 MTTR/MTBF 테이블"):
+                    show_cols = ['설비_KEY', '설비유형', '라인', '전체건수',
+                                 'BM건수', '클러스터건수(BM)', 'MTTR(분)',
+                                 'MTBF_근사(시간)', '총정지시간(분)',
+                                 '분석기간_가동시간(h)']
+                    show_cols = [c for c in show_cols if c in mttr_df.columns]
+                    st.dataframe(mttr_df[show_cols], use_container_width=True)
+
+                # ── 데이터 품질 문제 목록 ─────────────────
+                with st.expander("⚠️ 데이터 보완 필요 목록 (MTBF 계산 정확도 영향)"):
+                    if quality_df.empty:
+                        st.success("데이터 품질 문제 없음")
+                    else:
+                        # 요약
+                        q_summary = quality_df.groupby('문제유형')['건수'].sum().reset_index()
+                        for _, qrow in q_summary.iterrows():
+                            st.markdown(
+                                f'<div class="warn-box">⚠️ <b>{qrow["문제유형"]}</b>: '
+                                f'총 {qrow["건수"]}건</div>',
+                                unsafe_allow_html=True)
+                        st.dataframe(quality_df, use_container_width=True)
+                        # 다운로드
+                        q_excel = to_excel({'데이터품질이슈': quality_df})
+                        st.download_button(
+                            "📥 품질이슈 Excel 다운로드", data=q_excel,
+                            file_name="데이터품질이슈.xlsx",
+                            mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
 
 
 # ══════════════════════════════════════════════════════
@@ -996,81 +1451,284 @@ with tab4:
         st.info("Tab1에서 데이터를 불러오고 '통합 실행'을 눌러주세요.")
     else:
         st.subheader("인원 업무부하 분석")
-        yrs4 = sorted(df['년'].dropna().unique().astype(int))
-        sel_y4 = st.multiselect("연도 선택",yrs4,default=yrs4,key='t4y')
-        wdf_base = df[df['년'].isin(sel_y4)].copy() if sel_y4 else df.copy()
+        wdf_base = apply_global_filter(df)
         worker_df = get_worker_df(wdf_base)
+
         if worker_df.empty:
             st.warning("조치자 데이터가 없습니다.")
         else:
+            # ── 기본 집계 ─────────────────────────────
             person_agg = (worker_df.groupby('조치자')
-                          .agg(출동건수=('소요시간','count'),총소요시간_분=('소요시간','sum'))
+                          .agg(출동건수=('소요시간','count'),
+                               총소요시간_분=('소요시간','sum'))
                           .reset_index())
-            person_agg['평균소요시간_분'] = (person_agg['총소요시간_분']/person_agg['출동건수']).round(1)
-            person_agg['총소요시간_시'] = (person_agg['총소요시간_분']/60).round(1)
-            person_agg = person_agg[person_agg['출동건수']>=1].sort_values('출동건수',ascending=False)
+            person_agg['평균소요시간_분'] = (
+                person_agg['총소요시간_분'] / person_agg['출동건수']).round(1)
+            person_agg['총소요시간_시'] = (person_agg['총소요시간_분'] / 60).round(1)
 
-            pa1,pa2 = st.columns(2)
+            # ── 단독/협업 분리 집계 ──────────────────
+            solo_agg = (worker_df[worker_df['출동유형']=='단독']
+                        .groupby('조치자').size().reset_index(name='단독콜'))
+            coop_agg = (worker_df[worker_df['출동유형']=='협업']
+                        .groupby('조치자').size().reset_index(name='협업콜'))
+            person_agg = person_agg.merge(solo_agg, on='조치자', how='left')
+            person_agg = person_agg.merge(coop_agg, on='조치자', how='left')
+            person_agg['단독콜'] = person_agg['단독콜'].fillna(0).astype(int)
+            person_agg['협업콜'] = person_agg['협업콜'].fillna(0).astype(int)
+            person_agg['협업비율(%)'] = (
+                person_agg['협업콜'] / person_agg['출동건수'] * 100).round(1)
+            person_agg = person_agg[person_agg['출동건수'] >= 1].sort_values(
+                '출동건수', ascending=False)
+
+            # ── KPI 요약 ──────────────────────────────
+            ka1, ka2, ka3, ka4 = st.columns(4)
+            ka1.metric("분석 인원", f"{len(person_agg)}명")
+            ka2.metric("단독 출동", f"{person_agg['단독콜'].sum():,}건")
+            ka3.metric("협업 출동", f"{person_agg['협업콜'].sum():,}건")
+            ka4.metric("평균 협업비율",
+                       f"{person_agg['협업비율(%)'].mean():.1f}%")
+            st.divider()
+
+            # ── 스택바: 단독/협업 분리 차트 ───────────
+            st.markdown("##### 인원별 출동건수 (단독 / 협업 구분)")
+            st.caption("협업 비율 높음 → 난이도 높은 고장 전문가 또는 추가 교육 필요 대상")
+            top20 = person_agg.head(20).copy()
+
+            fig_stack = go.Figure()
+            fig_stack.add_trace(go.Bar(
+                name='단독 출동',
+                x=top20['조치자'], y=top20['단독콜'],
+                marker_color='#1e3a5f',
+                text=top20['단독콜'],
+                textposition='inside',
+                hovertemplate='<b>%{x}</b><br>단독콜: %{y}건<extra></extra>'))
+            fig_stack.add_trace(go.Bar(
+                name='협업 출동',
+                x=top20['조치자'], y=top20['협업콜'],
+                marker_color='#e67e22',
+                text=top20['협업콜'],
+                textposition='inside',
+                hovertemplate='<b>%{x}</b><br>협업콜: %{y}건<extra></extra>'))
+            fig_stack.update_layout(
+                barmode='stack', height=420,
+                margin=dict(t=30, b=60),
+                xaxis_tickangle=-30,
+                legend=dict(orientation='h', y=1.05))
+            st.plotly_chart(fig_stack, use_container_width=True)
+
+            # ── 협업비율 상위 경고 ────────────────────
+            high_coop = person_agg[person_agg['협업비율(%)'] >= 70].head(5)
+            if not high_coop.empty:
+                names = ', '.join(
+                    f"{r['조치자']}({r['협업비율(%)']}%)"
+                    for _, r in high_coop.iterrows())
+                st.markdown(
+                    f'<div class="warn-box">⚠️ 협업 비율 70% 이상: <b>{names}</b>'
+                    f' — 해당 인원이 담당하는 설비 난이도 또는 인력 배치 검토 필요'
+                    f'</div>', unsafe_allow_html=True)
+
+            pa1, pa2 = st.columns(2)
             with pa1:
-                st.markdown("##### 인원별 출동건수")
-                fig_p1 = px.bar(person_agg.head(20),x='조치자',y='출동건수',
-                                color='출동건수',color_continuous_scale='Blues',
-                                custom_data=['총소요시간_시','평균소요시간_분'])
-                fig_p1.update_traces(texttemplate='%{y}',textposition='outside',
-                    hovertemplate='<b>%{x}</b><br>출동: %{y}건<br>총소요: %{customdata[0]:.1f}시간<extra></extra>')
-                fig_p1.update_layout(height=400,margin=dict(t=20,b=60),showlegend=False,xaxis_tickangle=-30)
-                st.plotly_chart(fig_p1,use_container_width=True)
-            with pa2:
                 st.markdown("##### 인원별 총 소요시간")
-                fig_p2 = px.bar(person_agg.head(20),x='조치자',y='총소요시간_시',
-                                color='총소요시간_시',color_continuous_scale='Reds',
-                                custom_data=['출동건수','평균소요시간_분'])
-                fig_p2.update_traces(texttemplate='%{y:.0f}h',textposition='outside',
-                    hovertemplate='<b>%{x}</b><br>총소요: %{y:.1f}시간<br>출동: %{customdata[0]}건<extra></extra>')
-                fig_p2.update_layout(height=400,margin=dict(t=20,b=60),showlegend=False,xaxis_tickangle=-30)
-                st.plotly_chart(fig_p2,use_container_width=True)
+                fig_p2 = px.bar(
+                    top20, x='조치자', y='총소요시간_시',
+                    color='총소요시간_시', color_continuous_scale='Reds',
+                    custom_data=['출동건수', '평균소요시간_분', '협업비율(%)'])
+                fig_p2.update_traces(
+                    texttemplate='%{y:.0f}h', textposition='outside',
+                    hovertemplate=(
+                        '<b>%{x}</b><br>총소요: %{y:.1f}시간<br>'
+                        '출동: %{customdata[0]}건<br>'
+                        '협업비율: %{customdata[2]:.1f}%<extra></extra>'))
+                fig_p2.update_layout(height=400, margin=dict(t=20, b=60),
+                                     showlegend=False, xaxis_tickangle=-30)
+                st.plotly_chart(fig_p2, use_container_width=True)
 
+            with pa2:
+                st.markdown("##### 협업 비율 순위")
+                coop_top = person_agg[person_agg['출동건수'] >= 3].sort_values(
+                    '협업비율(%)', ascending=False).head(20)
+                fig_coop = px.bar(
+                    coop_top, x='조치자', y='협업비율(%)',
+                    color='협업비율(%)', color_continuous_scale='Oranges',
+                    custom_data=['출동건수', '단독콜', '협업콜'])
+                fig_coop.add_hline(y=50, line_dash='dash', line_color='red',
+                                   annotation_text='50% 기준선')
+                fig_coop.update_traces(
+                    texttemplate='%{y:.0f}%', textposition='outside',
+                    hovertemplate=(
+                        '<b>%{x}</b><br>협업비율: %{y:.1f}%<br>'
+                        '단독: %{customdata[1]}건 / 협업: %{customdata[2]}건<extra></extra>'))
+                fig_coop.update_layout(height=400, margin=dict(t=20, b=60),
+                                       showlegend=False, xaxis_tickangle=-30)
+                st.plotly_chart(fig_coop, use_container_width=True)
+
+            # ── 협업 필요 설비 Top N ───────────────────
+            st.markdown("##### 협업 출동이 많은 설비 Top 15")
+            st.caption("항상 2인 이상 출동하는 설비 → 난이도 분류, 안전 기준 수립 참고")
+            if '설비_KEY' in worker_df.columns:
+                coop_equip = (worker_df[worker_df['출동유형'] == '협업']
+                              .groupby('설비_KEY')
+                              .agg(협업출동건수=('출동유형','count'),
+                                   평균인원수=('협업인원수','mean'))
+                              .reset_index()
+                              .sort_values('협업출동건수', ascending=False)
+                              .head(15))
+                if not coop_equip.empty:
+                    coop_equip['평균인원수'] = coop_equip['평균인원수'].round(1)
+                    fig_ce = px.bar(
+                        coop_equip, x='협업출동건수', y='설비_KEY',
+                        orientation='h', color='평균인원수',
+                        color_continuous_scale='YlOrRd',
+                        custom_data=['평균인원수'])
+                    fig_ce.update_traces(
+                        texttemplate='%{x}건', textposition='outside',
+                        hovertemplate=(
+                            '<b>%{y}</b><br>협업출동: %{x}건<br>'
+                            '평균인원: %{customdata[0]:.1f}명<extra></extra>'))
+                    fig_ce.update_layout(
+                        height=max(380, len(coop_equip)*28),
+                        margin=dict(t=20, b=20), yaxis_title='')
+                    st.plotly_chart(fig_ce, use_container_width=True)
+
+            # ── 협업 시 MTTR vs 단독 MTTR 비교 ──────
+            st.markdown("##### 단독 vs 협업 출동 시 평균 MTTR 비교")
+            st.caption("협업해도 MTTR이 길면 → 부품·기술 문제 가능성")
+            mttr_comp = (worker_df[worker_df['출동유형'].isin(['단독','협업'])]
+                         .groupby('출동유형')['소요시간']
+                         .mean().reset_index())
+            mttr_comp.columns = ['출동유형', '평균MTTR(분)']
+            mttr_comp['평균MTTR(분)'] = mttr_comp['평균MTTR(분)'].round(1)
+            fig_mttr_comp = px.bar(
+                mttr_comp, x='출동유형', y='평균MTTR(분)',
+                color='출동유형',
+                color_discrete_map={'단독': '#1e3a5f', '협업': '#e67e22'},
+                text='평균MTTR(분)')
+            fig_mttr_comp.update_traces(textposition='outside')
+            fig_mttr_comp.update_layout(height=320, showlegend=False,
+                                        margin=dict(t=20, b=20))
+            st.plotly_chart(fig_mttr_comp, use_container_width=True)
+
+            # ── 주별 업무시간 ──────────────────────────
             st.markdown("##### ⚠️ 주별 업무시간 (보전 소요시간 기준)")
             wdf2 = worker_df[worker_df['발생일시'].notna()].copy()
             wdf2['연도'] = wdf2['발생일시'].dt.year
             wdf2['주차'] = wdf2['발생일시'].dt.isocalendar().week.astype(int)
             weekly = wdf2.groupby(['조치자','연도','주차'])['소요시간'].sum().reset_index()
-            weekly['소요시간_시'] = (weekly['소요시간']/60).round(1)
+            weekly['소요시간_시'] = (weekly['소요시간'] / 60).round(1)
             weekly['초과위험'] = weekly['소요시간_시'] > 20
             over_workers = weekly[weekly['초과위험']]['조치자'].unique()
-            if len(over_workers)>0:
-                st.markdown(f'<div class="warn-box">⚠️ 주간 보전업무 20시간 초과: '
-                            f'<b>{", ".join(over_workers[:10])}</b> ({len(over_workers)}명)</div>',
-                            unsafe_allow_html=True)
+            if len(over_workers) > 0:
+                st.markdown(
+                    f'<div class="warn-box">⚠️ 주간 보전업무 20시간 초과: '
+                    f'<b>{", ".join(over_workers[:10])}</b> ({len(over_workers)}명)</div>',
+                    unsafe_allow_html=True)
             top_workers = person_agg['조치자'].tolist()
-            sel_w = st.selectbox("인원 선택 (주별 차트)",top_workers,key='t4w')
-            w_data = weekly[weekly['조치자']==sel_w].copy()
-            w_data['년주'] = w_data['연도'].astype(str) + '-W' + w_data['주차'].astype(str).str.zfill(2)
-            fig_wk = px.bar(w_data,x='년주',y='소요시간_시',color='초과위험',
-                            color_discrete_map={True:'#dc3545',False:'#1e3a5f'})
-            fig_wk.add_hline(y=20,line_dash='dash',line_color='orange',annotation_text='경고 20h/주')
-            fig_wk.update_layout(height=340,margin=dict(t=30,b=50),xaxis_tickangle=-45,showlegend=False,
-                                  title=f'{sel_w} — 주별 보전업무 소요시간')
-            st.plotly_chart(fig_wk,use_container_width=True)
+            sel_w = st.selectbox("인원 선택 (주별 차트)", top_workers, key='t4w')
+            w_data = weekly[weekly['조치자'] == sel_w].copy()
+            w_data['년주'] = (w_data['연도'].astype(str) + '-W' +
+                              w_data['주차'].astype(str).str.zfill(2))
+            fig_wk = px.bar(w_data, x='년주', y='소요시간_시',
+                            color='초과위험',
+                            color_discrete_map={True: '#dc3545', False: '#1e3a5f'})
+            fig_wk.add_hline(y=20, line_dash='dash', line_color='orange',
+                              annotation_text='경고 20h/주')
+            fig_wk.update_layout(
+                height=340, margin=dict(t=30, b=50),
+                xaxis_tickangle=-45, showlegend=False,
+                title=f'{sel_w} — 주별 보전업무 소요시간')
+            st.plotly_chart(fig_wk, use_container_width=True)
 
-            st.markdown("##### 시간대별 출동 히트맵")
-            wdf3 = worker_df[worker_df['발생일시'].notna()].copy()
-            wdf3['요일_en'] = wdf3['발생일시'].dt.day_name()
-            wdf3['시간'] = wdf3['발생일시'].dt.hour
-            heat = wdf3.groupby(['요일_en','시간']).size().reset_index(name='건수')
-            day_kr = {'Monday':'월','Tuesday':'화','Wednesday':'수','Thursday':'목',
-                      'Friday':'금','Saturday':'토','Sunday':'일'}
-            day_order = ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday']
-            heat['요일'] = pd.Categorical(heat['요일_en'].map(day_kr),
-                                          categories=[day_kr[d] for d in day_order],ordered=True)
-            pivot_h = heat.pivot(index='요일',columns='시간',values='건수').fillna(0)
-            fig_heat = px.imshow(pivot_h,color_continuous_scale='YlOrRd',text_auto=True,
-                                  labels=dict(x='시간(시)',y='요일',color='건수'))
-            fig_heat.update_layout(height=320,margin=dict(t=40,b=20))
-            st.plotly_chart(fig_heat,use_container_width=True)
+            # ── 전체 인원 콜수 히트맵 ─────────────────────
+            st.divider()
+            st.markdown("##### 👷 전체 인원 콜수 히트맵 (요일 × 시간대)")
+            st.caption("전체 조치자 출동 건수 합산 기준 — 색이 진할수록 출동 집중 시간대")
+            _wdf_all = worker_df[worker_df['발생일시'].notna()].copy()
+            if not _wdf_all.empty:
+                _wdf_all['요일_en'] = _wdf_all['발생일시'].dt.day_name()
+                _wdf_all['시간']    = _wdf_all['발생일시'].dt.hour
+                _heat_all = (_wdf_all.groupby(['요일_en','시간'])
+                             .size().reset_index(name='콜수'))
+                _day_kr4    = {'Monday':'월','Tuesday':'화','Wednesday':'수',
+                               'Thursday':'목','Friday':'금','Saturday':'토','Sunday':'일'}
+                _day_order4 = ['Monday','Tuesday','Wednesday','Thursday',
+                               'Friday','Saturday','Sunday']
+                _heat_all['요일'] = pd.Categorical(
+                    _heat_all['요일_en'].map(_day_kr4),
+                    categories=[_day_kr4[d] for d in _day_order4], ordered=True)
+                _pivot_all4 = (_heat_all.pivot(index='요일', columns='시간', values='콜수')
+                               .reindex(columns=list(range(24)), fill_value=0)
+                               .fillna(0).astype(int))
+                _peak_hour4 = int(_pivot_all4.sum().idxmax())
+                _peak_day4  = _pivot_all4.sum(axis=1).idxmax()
+                _peak_val4  = int(_pivot_all4.values.max())
+                st.caption(
+                    f"🔴 최대 집중: **{_peak_day4}요일 {_peak_hour4}시** "
+                    f"| 최고 콜수: **{_peak_val4}건**")
+                _fig_all4 = px.imshow(
+                    _pivot_all4,
+                    color_continuous_scale='YlOrRd',
+                    text_auto=True,
+                    labels=dict(x='시간(시)', y='요일', color='콜수'),
+                    aspect='auto')
+                _fig_all4.update_layout(
+                    height=320, margin=dict(t=20, b=20),
+                    xaxis=dict(tickmode='linear', tick0=0, dtick=1))
+                st.plotly_chart(_fig_all4, use_container_width=True)
+                # 주간/야간 KPI
+                _h1, _h2, _h3 = st.columns(3)
+                _day_tot4   = int(_pivot_all4.loc[:, 6:17].values.sum())
+                _night_tot4 = int(_pivot_all4.loc[:, [*range(0,6), *range(18,24)]].values.sum())
+                _total4     = int(_pivot_all4.values.sum())
+                _h1.metric("전체 콜수", f"{_total4:,}건")
+                _h2.metric("주간 콜수 (06~17시)", f"{_day_tot4:,}건",
+                           f"{_day_tot4/_total4*100:.1f}%" if _total4 else "0%")
+                _h3.metric("야간 콜수 (18~05시)", f"{_night_tot4:,}건",
+                           f"{_night_tot4/_total4*100:.1f}%" if _total4 else "0%")
+            else:
+                st.info("조치자 데이터가 없어 히트맵을 표시할 수 없습니다.")
 
-            with st.expander("📋 인원별 상세 집계"):
-                st.dataframe(person_agg,use_container_width=True)
+            # ── 시간대별 출동 히트맵 (선택 인원 기준) ──────
+            st.markdown(f"##### 시간대별 출동 히트맵 — {sel_w}")
+            st.caption(f"선택 인원 **{sel_w}** 의 출동 시간대 분포")
+            wdf3 = worker_df[
+                (worker_df['발생일시'].notna()) &
+                (worker_df['조치자'] == sel_w)
+            ].copy()
+            if wdf3.empty:
+                st.info(f"{sel_w} 의 출동 데이터가 없습니다.")
+            else:
+                wdf3['요일_en'] = wdf3['발생일시'].dt.day_name()
+                wdf3['시간'] = wdf3['발생일시'].dt.hour
+                heat = wdf3.groupby(['요일_en','시간']).size().reset_index(name='건수')
+                day_kr = {'Monday':'월','Tuesday':'화','Wednesday':'수','Thursday':'목',
+                          'Friday':'금','Saturday':'토','Sunday':'일'}
+                day_order = ['Monday','Tuesday','Wednesday','Thursday',
+                             'Friday','Saturday','Sunday']
+                heat['요일'] = pd.Categorical(
+                    heat['요일_en'].map(day_kr),
+                    categories=[day_kr[d] for d in day_order], ordered=True)
+                pivot_h = (heat.pivot(index='요일', columns='시간', values='건수')
+                           .reindex(columns=list(range(24)), fill_value=0)
+                           .fillna(0).astype(int))
+                fig_heat = px.imshow(
+                    pivot_h, color_continuous_scale='YlOrRd',
+                    text_auto=True,
+                    labels=dict(x='시간(시)', y='요일', color='건수'),
+                    aspect='auto')
+                fig_heat.update_layout(
+                    height=320, margin=dict(t=40, b=20),
+                    xaxis=dict(tickmode='linear', tick0=0, dtick=1),
+                    title=f'{sel_w} — 시간대별 출동 분포')
+                st.plotly_chart(fig_heat, use_container_width=True)
+
+            # ── 상세 집계 테이블 ───────────────────────
+            with st.expander("📋 인원별 상세 집계 (단독/협업 포함)"):
+                show_person = person_agg[[
+                    '조치자','출동건수','단독콜','협업콜','협업비율(%)',
+                    '총소요시간_시','평균소요시간_분'
+                ]].copy()
+                st.dataframe(show_person, use_container_width=True)
 
 
 # ══════════════════════════════════════════════════════
@@ -1083,11 +1741,8 @@ with tab5:
     else:
         st.markdown("## 🏆 설비 위험도 Ranking")
         st.caption("위험도 = 고장빈도 × 가중치 + 총정지시간 × 가중치 + 평균MTTR × 가중치")
-        rf1,rf2,rf3 = st.columns([2,2,2])
+        rf1,rf2,rf3 = st.columns([3,3,2])
         with rf1:
-            yrs_r = sorted(df['년'].dropna().unique().astype(int))
-            sel_yr_r = st.multiselect("연도",yrs_r,default=yrs_r,key='r_yr')
-        with rf2:
             eq_r = ['전체']+sorted(df['설비유형'].dropna().unique().tolist(),key=str)
             sel_eq_r = st.selectbox("설비유형",eq_r,key='r_eq')
         with rf3:
@@ -1097,7 +1752,7 @@ with tab5:
         with rw2: w_time = st.slider("정지시간 가중치(%)",0,100,40,5,key='r_wt')
         with rw3: w_mttr = st.slider("MTTR 가중치(%)",0,100,20,5,key='r_wm')
 
-        rdf = df[df['년'].isin(sel_yr_r)].copy() if sel_yr_r else df.copy()
+        rdf = apply_global_filter(df)
         if sel_eq_r != '전체': rdf = rdf[rdf['설비유형']==sel_eq_r]
         risk = (rdf.groupby(['라인_차종','고장설비','설비유형'])
                 .agg(건수=('소요시간','count'),총정지시간=('소요시간','sum'),평균MTTR=('소요시간','mean'))
@@ -1150,9 +1805,6 @@ with tab6:
     else:
         st.markdown("## ⏱️ 유실시간 분석")
         lf1,lf2,lf3 = st.columns(3)
-        with lf1:
-            yrs_l = sorted(df['년'].dropna().unique().astype(int))
-            sel_yr_l = st.multiselect("연도",yrs_l,default=yrs_l,key='l_yr')
         with lf2:
             eq_l = ['전체']+sorted(df['설비유형'].dropna().unique().tolist(),key=str)
             sel_eq_l = st.selectbox("설비유형",eq_l,key='l_eq')
@@ -1160,7 +1812,7 @@ with tab6:
             lc_l = ['전체']+sorted(df['라인_차종'].dropna().unique().tolist(),key=str)
             sel_lc_l = st.selectbox("차종·라인",lc_l,key='l_lc')
 
-        ldf = df[df['년'].isin(sel_yr_l)].copy() if sel_yr_l else df.copy()
+        ldf = apply_global_filter(df)
         if sel_eq_l != '전체': ldf = ldf[ldf['설비유형']==sel_eq_l]
         if sel_lc_l != '전체': ldf = ldf[ldf['라인_차종']==sel_lc_l]
         ldf_v = ldf[ldf['소요시간'].notna()].copy()
@@ -1206,16 +1858,13 @@ with tab7:
     else:
         st.markdown("## 🔧 예방정비 추천")
         pf1,pf2,pf3 = st.columns([2,2,1])
-        with pf1:
-            yrs_p = sorted(df['년'].dropna().unique().astype(int))
-            sel_yr_p = st.multiselect("연도",yrs_p,default=yrs_p,key='t7y')
         with pf2:
             eq_p = ['전체']+sorted(df['설비유형'].dropna().unique().tolist(),key=str)
             sel_eq_p = st.selectbox("설비유형",eq_p,key='t7eq')
         with pf3:
             min_cnt_p = st.number_input("최소 고장건수",min_value=1,value=2,key='t7mn')
 
-        pdf = df[df['년'].isin(sel_yr_p)].copy() if sel_yr_p else df.copy()
+        pdf = apply_global_filter(df)
         if sel_eq_p != '전체': pdf = pdf[pdf['설비유형']==sel_eq_p]
         pdf_v = pdf[pdf['소요시간'].notna() & pdf['발생일시'].notna()].copy()
         if pdf_v.empty:
@@ -1294,14 +1943,11 @@ with tab8:
     else:
         st.markdown("## 📈 월별 고장 트렌드")
         tf1,tf2 = st.columns([3,1])
-        with tf1:
-            yrs_t = sorted(df['년'].dropna().unique().astype(int))
-            sel_yr_t = st.multiselect("연도",yrs_t,default=yrs_t,key='t8y')
         with tf2:
             eq_t = ['전체']+sorted(df['설비유형'].dropna().unique().tolist(),key=str)
             sel_eq_t = st.selectbox("설비유형",eq_t,key='t8eq')
 
-        tdf = df[df['년'].isin(sel_yr_t)].copy() if sel_yr_t else df.copy()
+        tdf = apply_global_filter(df)
         if sel_eq_t != '전체': tdf = tdf[tdf['설비유형']==sel_eq_t]
         tdf = tdf[tdf['발생일시'].notna()].copy()
         tdf['년월'] = tdf['발생일시'].dt.to_period('M').astype(str)
@@ -1347,7 +1993,8 @@ with tab8:
             fig_hm.update_layout(height=max(280,len(pivot_ln)*28+80),margin=dict(t=20,b=20))
             st.plotly_chart(fig_hm,use_container_width=True)
 
-            if len(sel_yr_t)>=2:
+            _t8_yrs = tdf['년'].dropna().unique() if tdf is not None and not tdf.empty else []
+            if len(_t8_yrs)>=2:
                 st.markdown("##### ④ 연도별 월별 비교")
                 tdf['월'] = tdf['발생일시'].dt.month
                 cmp = tdf.groupby(['년','월']).size().reset_index(name='건수')
@@ -1425,14 +2072,9 @@ with tab9:
                 avg_cnt  = mo['건수'].mean()
                 avg_stop = mo['정지'].mean()
                 avg_mttr = d['소요시간'].mean()
-                mtbf_vals = []
-                for _, grp in d.groupby('설비_KEY'):
-                    grp = grp.sort_values('발생일시')
-                    if len(grp) >= 2:
-                        gaps = grp['발생일시'].diff().dropna().dt.total_seconds() / 3600
-                        gaps = gaps[gaps > 0]
-                        if len(gaps): mtbf_vals.append(gaps.mean())
-                avg_mtbf = np.mean(mtbf_vals) if mtbf_vals else 0
+                # 방법B 근사 MTBF
+                mttr_r, _ = calc_mttr_mtbf(d, cluster_min=60)
+                avg_mtbf = mttr_r['MTBF_근사(시간)'].dropna().mean() if not mttr_r.empty else 0
                 return avg_cnt, avg_stop, avg_mttr, avg_mtbf
 
             cur_cnt, cur_stop, cur_mttr, cur_mtbf   = _calc_kpi_metrics(kdf)
@@ -1472,14 +2114,9 @@ with tab9:
                 cnt  = len(d)
                 stop = d['소요시간'].sum()
                 mttr = d['소요시간'].mean()
-                mtbf_vals = []
-                for _, grp in d.groupby('설비_KEY'):
-                    grp = grp.sort_values('발생일시')
-                    if len(grp) >= 2:
-                        gaps = grp['발생일시'].diff().dropna().dt.total_seconds() / 3600
-                        gaps = gaps[gaps > 0]
-                        if len(gaps): mtbf_vals.append(gaps.mean())
-                mtbf = np.mean(mtbf_vals) if mtbf_vals else 0
+                # 방법B 근사 MTBF
+                mttr_r, _ = calc_mttr_mtbf(d, cluster_min=60)
+                mtbf = mttr_r['MTBF_근사(시간)'].dropna().mean() if not mttr_r.empty else 0
                 return cnt, stop, mttr, mtbf
 
             cur_cnt,  cur_stop,  cur_mttr,  cur_mtbf  = _calc_kpi_metrics_mo(kdf)
@@ -1650,14 +2287,11 @@ with tab10:
     else:
         st.markdown("## 🔄 돌발(BM) vs 예방(PM) 분석")
         bf1,bf2 = st.columns([3,1])
-        with bf1:
-            yrs_b = sorted(df['년'].dropna().unique().astype(int))
-            sel_yr_b = st.multiselect("연도",yrs_b,default=yrs_b,key='t10y')
         with bf2:
             eq_b = ['전체']+sorted(df['설비유형'].dropna().unique().tolist(),key=str)
             sel_eq_b = st.selectbox("설비유형",eq_b,key='t10eq')
 
-        bdf = df[df['년'].isin(sel_yr_b)].copy() if sel_yr_b else df.copy()
+        bdf = apply_global_filter(df)
         if sel_eq_b != '전체': bdf = bdf[bdf['설비유형']==sel_eq_b]
 
         if bdf.empty:
@@ -1740,9 +2374,6 @@ with tab11:
         st.caption("수리 완료가 아니라 **재발 억제** 관점에서 관리합니다")
 
         rc1,rc2,rc3,rc4 = st.columns([2,2,1,1])
-        with rc1:
-            yrs_rc = sorted(df['년'].dropna().unique().astype(int))
-            sel_yr_rc = st.multiselect("연도",yrs_rc,default=yrs_rc,key='t11y')
         with rc2:
             eq_rc = ['전체']+sorted(df['설비유형'].dropna().unique().tolist(),key=str)
             sel_eq_rc = st.selectbox("설비유형",eq_rc,key='t11eq')
@@ -1753,7 +2384,7 @@ with tab11:
                                              help="설비별 재발률 차트에 포함할 최소 고장건수 기준")
         win_days = int(window_rc.replace('일',''))
 
-        rdf = df[df['년'].isin(sel_yr_rc)].copy() if sel_yr_rc else df.copy()
+        rdf = apply_global_filter(df)
         if sel_eq_rc != '전체': rdf = rdf[rdf['설비유형']==sel_eq_rc]
         rdf = rdf[rdf['발생일시'].notna()].sort_values('발생일시').reset_index(drop=True)
 
@@ -1886,14 +2517,11 @@ with tab12:
                 "원본 데이터에 코드 컬럼을 직접 추가하면 정확도가 더 높아집니다.")
 
         sf1,sf2 = st.columns([3,1])
-        with sf1:
-            yrs_s = sorted(df['년'].dropna().unique().astype(int))
-            sel_yr_s = st.multiselect("연도",yrs_s,default=yrs_s,key='t12y')
         with sf2:
             eq_s = ['전체']+sorted(df['설비유형'].dropna().unique().tolist(),key=str)
             sel_eq_s = st.selectbox("설비유형",eq_s,key='t12eq')
 
-        sdf = df[df['년'].isin(sel_yr_s)].copy() if sel_yr_s else df.copy()
+        sdf = apply_global_filter(df)
         if sel_eq_s != '전체': sdf = sdf[sdf['설비유형']==sel_eq_s]
 
         if sdf.empty:
@@ -2222,11 +2850,16 @@ with tab14:
             if st.button("Excel 파일 생성",use_container_width=True,key='ex1'):
                 with st.spinner("생성 중..."):
                     try:
-                        mttr_r = calc_mttr_mtbf(df)
+                        mttr_r, quality_r = calc_mttr_mtbf(df)
                         wdf_all = get_worker_df(df)
                         person_r = (wdf_all.groupby('조치자')
-                                    .agg(출동건수=('소요시간','count'),총소요시간_분=('소요시간','sum'))
+                                    .agg(출동건수=('소요시간','count'),
+                                         단독콜=('출동유형', lambda x: (x=='단독').sum()),
+                                         협업콜=('출동유형', lambda x: (x=='협업').sum()),
+                                         총소요시간_분=('소요시간','sum'))
                                     .reset_index().sort_values('출동건수',ascending=False))
+                        person_r['협업비율(%)'] = (
+                            person_r['협업콜'] / person_r['출동건수'] * 100).round(1)
                         pareto_r = (df.groupby(['라인','설비유형'])
                                     .agg(건수=('소요시간','count'),총정지_분=('소요시간','sum'))
                                     .reset_index().sort_values('건수',ascending=False))
@@ -2255,6 +2888,7 @@ with tab14:
                         }
                         if not code_r.empty: sheets['표준코드집계'] = code_r
                         if not recur_r.empty: sheets['설비별재발률'] = recur_r
+                        if not quality_r.empty: sheets['데이터품질이슈'] = quality_r
                         excel_data = to_excel(sheets)
                         st.download_button("⬇️ Excel 다운로드",data=excel_data,
                                            file_name=f"보전팀_분석_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
