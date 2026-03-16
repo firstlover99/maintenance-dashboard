@@ -60,6 +60,25 @@ EQUIP_NORM = {
     '800T':'프레스-800T','600T':'프레스-600T',
 }
 
+# ── 라인명 정규화 맵 (입력 오류 통합) ──────────────────
+import re as _re
+
+def norm_line(v):
+    """라인명 정규화 — 대소문자/오타/단위표기 통합"""
+    if v is None or (isinstance(v, float) and __import__('numpy').isnan(v)):
+        return v
+    s = str(v).strip()
+    if not s or s in ('nan','None',''): return s
+    # 대문자 통일
+    su = s.upper()
+    # 프레스 톤수 정규화: 숫자+t/톤/T → 숫자+T
+    su = _re.sub(r'(\d+)(톤|t\b)', lambda m: m.group(1)+'T', su)
+    # ASSY 통합: ASS'Y, Assy, ASSY → ASSY
+    su = _re.sub(r"ASS'?Y", 'ASSY', su, flags=_re.IGNORECASE)
+    # 연속 공백 정리
+    su = _re.sub(r'\s+', ' ', su).strip()
+    return su
+
 # ── 표준 코드 정의 ──────────────────────────────────
 # 고장계통코드
 FAULT_SYSTEM_MAP = {
@@ -507,6 +526,16 @@ def merge_dfs(press_df, robot_df):
     mask_no_car = (merged['라인_차종'].astype(str).str.endswith(' / ') |
                    merged['라인_차종'].astype(str).str.contains(r'/ $', regex=True))
     merged.loc[mask_no_car,'라인_차종'] = merged.loc[mask_no_car,'라인'].astype(str).str.strip()
+    # 라인명 정규화 (입력 오류 통합: 1500t→1500T, ASS'Y→ASSY 등)
+    if '라인' in merged.columns:
+        merged['라인'] = merged['라인'].apply(
+            lambda v: norm_line(v) if pd.notna(v) else v)
+    if '라인_차종' in merged.columns:
+        merged['라인_차종'] = merged['라인_차종'].apply(
+            lambda v: norm_line(v) if pd.notna(v) else v)
+    if '설비_KEY' in merged.columns:
+        merged['설비_KEY'] = merged['라인_차종'].astype(str) + ' | ' + \
+            merged['고장설비'].fillna('').astype(str).str.strip()
     merged['세부분류'] = merged.apply(get_세부분류, axis=1)
     merged['부위그룹'] = merged['고장부위'].apply(get_고장부위_그룹) if '고장부위' in merged.columns else '기타'
     # ── 재발여부 계산 (90일 기준) ──
@@ -1252,7 +1281,7 @@ with tab3:
         st.info("Tab1에서 데이터를 불러오고 '통합 실행'을 눌러주세요.")
     else:
         st.subheader("설비 MTTR / MTBF 분석")
-        st.caption("⚠️ MTBF는 **근사값**입니다 — 월~토 일 15시간 가동 기준, ")
+        st.caption("⚠️ MTBF는 근사값입니다 — 월~토 일15시간 가동 적용")
 
         # 전역 기간 필터 적용
         mf1, mf2, mf3 = st.columns([3, 2, 1])
@@ -1356,7 +1385,7 @@ with tab3:
                     fig_mtbf.update_layout(
                         height=max(420, len(mtbf_data)*28),
                         margin=dict(t=30, b=20), yaxis_title='',
-                        legend=dict(orientation='h', y=1.05))
+                        legend=dict(orientation='h',y=1.0,x=0,yanchor='bottom',xanchor='left'))
                     st.plotly_chart(fig_mtbf, use_container_width=True)
 
                     # 1시간 미만 설비 경고 배지
@@ -1491,7 +1520,7 @@ with tab4:
 
             # ── 스택바: 단독/협업 분리 차트 ───────────
             st.markdown("##### 인원별 출동건수 (단독 / 협업 구분)")
-            st.caption("협업 비율에 대한 해석 필요")
+            st.caption("협업 비율 높음 → 난이도 높은 고장 전문가 또는 추가 교육 필요 대상")
             top20 = person_agg.head(20).copy()
 
             fig_stack = go.Figure()
@@ -1722,6 +1751,51 @@ with tab4:
                     title=f'{sel_w} — 시간대별 출동 분포')
                 st.plotly_chart(fig_heat, use_container_width=True)
 
+            # ── 개인별 콜수 집계 테이블 ─────────────────
+            st.divider()
+            st.markdown(f"##### 📋 개인별 콜수 집계 — {sel_w}")
+            st.caption(f"선택 인원 **{sel_w}** 의 설비별/요일별 출동 상세")
+            if not wdf3.empty:
+                # 시간대 구분 추가
+                _wdf3_detail = wdf3.copy()
+                _wdf3_detail['시간대'] = _wdf3_detail['발생일시'].dt.hour.apply(
+                    lambda h: '주간(06~17시)' if 6<=h<=17 else '야간(18~05시)')
+                _wdf3_detail['요일'] = _wdf3_detail['발생일시'].dt.day_name().map(
+                    {'Monday':'월','Tuesday':'화','Wednesday':'수','Thursday':'목',
+                     'Friday':'금','Saturday':'토','Sunday':'일'})
+                # 요일별 콜수
+                _day_call = (_wdf3_detail.groupby('요일')['소요시간']
+                             .agg(콜수='count', 총소요시간_분='sum')
+                             .reset_index())
+                _day_call['평균소요_분'] = (_day_call['총소요시간_분']/_day_call['콜수']).round(1)
+                _day_order_kr = ['월','화','수','목','금','토','일']
+                _day_call['요일'] = pd.Categorical(
+                    _day_call['요일'], categories=_day_order_kr, ordered=True)
+                _day_call = _day_call.sort_values('요일')
+                # 주간/야간 콜수
+                _shift_call = (_wdf3_detail.groupby('시간대')['소요시간']
+                               .agg(콜수='count', 총소요시간_분='sum').reset_index())
+                _dc1, _dc2 = st.columns(2)
+                with _dc1:
+                    st.markdown("**요일별 콜수**")
+                    st.dataframe(_day_call[['요일','콜수','총소요시간_분','평균소요_분']]
+                                 .rename(columns={'총소요시간_분':'총소요(분)','평균소요_분':'평균소요(분)'}),
+                                 use_container_width=True, hide_index=True)
+                with _dc2:
+                    st.markdown("**주간/야간 콜수**")
+                    st.dataframe(_shift_call[['시간대','콜수','총소요시간_분']]
+                                 .rename(columns={'총소요시간_분':'총소요(분)'}),
+                                 use_container_width=True, hide_index=True)
+                # 설비별 콜수 Top10
+                st.markdown("**설비별 콜수 Top 10**")
+                _equip_call = (_wdf3_detail.groupby('설비_KEY')['소요시간']
+                               .agg(콜수='count', 총소요시간_분='sum')
+                               .reset_index().sort_values('콜수', ascending=False).head(10))
+                _equip_call['평균소요_분'] = (_equip_call['총소요시간_분']/_equip_call['콜수']).round(1)
+                st.dataframe(_equip_call[['설비_KEY','콜수','총소요시간_분','평균소요_분']]
+                             .rename(columns={'총소요시간_분':'총소요(분)','평균소요_분':'평균소요(분)'}),
+                             use_container_width=True, hide_index=True)
+
             # ── 상세 집계 테이블 ───────────────────────
             with st.expander("📋 인원별 상세 집계 (단독/협업 포함)"):
                 show_person = person_agg[[
@@ -1786,8 +1860,8 @@ with tab5:
         fig_risk.update_traces(
             hovertemplate=('<b>%{y}</b><br>위험도: %{x:.1f}점<br>설비유형: %{customdata[3]}<br>'
                            '건수: %{customdata[0]}건<br>총정지: %{customdata[1]:,.0f}분<extra></extra>'))
-        fig_risk.update_layout(height=max(480,top_n_r*26),margin=dict(t=30,b=20,l=10,r=20),
-                                legend=dict(orientation='h',y=1.05))
+        fig_risk.update_layout(height=max(480,top_n_r*26),margin=dict(t=50,b=20,l=10,r=20),
+                                legend=dict(orientation='h',y=1.0,x=0,yanchor='bottom',xanchor='left'))
         st.plotly_chart(fig_risk,use_container_width=True)
 
         with st.expander("📋 위험도 전체 순위표"):
@@ -2428,7 +2502,8 @@ with tab11:
         fig_rr.update_traces(
             hovertemplate='<b>%{y}</b><br>재발률: %{x:.1f}%<br>전체: %{customdata[0]}건 / 재발: %{customdata[1]}건<extra></extra>')
         fig_rr.add_vline(x=30,line_dash='dash',line_color='#e67e22',annotation_text='경고 30%')
-        fig_rr.update_layout(height=max(400,len(top_recur)*26),margin=dict(t=20,b=20),yaxis_title='')
+        fig_rr.update_layout(height=max(400,len(top_recur)*26),margin=dict(t=50,b=20),yaxis_title='',
+                             legend=dict(orientation='h',y=1.0,x=0,yanchor='bottom',xanchor='left'))
         st.plotly_chart(fig_rr,use_container_width=True)
 
         # ── 재발 간격 상세 분석 ──
@@ -2513,7 +2588,8 @@ with tab12:
         st.markdown("## 🏷️ 표준코드 분석")
         st.caption("고장계통코드 · 원인코드 · 조치코드 기반 정밀 Pareto 분석")
 
-        st.info("💡 표준코드는 현상/원인/조치 텍스트를 자동 분류")
+        st.info("💡 표준코드는 현상/원인/조치 텍스트를 자동 분류한 값입니다. "
+                "차후 원본 데이터에 코드 컬럼을 직접 추가필요.")
 
         sf1,sf2 = st.columns([3,1])
         with sf2:
