@@ -1252,7 +1252,7 @@ with tab3:
         st.info("Tab1에서 데이터를 불러오고 '통합 실행'을 눌러주세요.")
     else:
         st.subheader("설비 MTTR / MTBF 분석")
-        st.caption("⚠️ MTBF는 **근사값**입니다 — 월~토 일 15시간 가동 기준, 방법B(달력 근사) 적용")
+        st.caption("⚠️ MTBF는 **근사값**입니다 — 월~토 일 15시간 가동 기준, ")
 
         # 전역 기간 필터 적용
         mf1, mf2, mf3 = st.columns([3, 2, 1])
@@ -1491,7 +1491,7 @@ with tab4:
 
             # ── 스택바: 단독/협업 분리 차트 ───────────
             st.markdown("##### 인원별 출동건수 (단독 / 협업 구분)")
-            st.caption("협업 비율 높음 → 난이도 높은 고장 전문가 또는 추가 교육 필요 대상")
+            st.caption("협업 비율에 대한 해석 필요")
             top20 = person_agg.head(20).copy()
 
             fig_stack = go.Figure()
@@ -2513,8 +2513,7 @@ with tab12:
         st.markdown("## 🏷️ 표준코드 분석")
         st.caption("고장계통코드 · 원인코드 · 조치코드 기반 정밀 Pareto 분석")
 
-        st.info("💡 표준코드는 현상/원인/조치 텍스트를 자동 분류한 값입니다. "
-                "원본 데이터에 코드 컬럼을 직접 추가하면 정확도가 더 높아집니다.")
+        st.info("💡 표준코드는 현상/원인/조치 텍스트를 자동 분류")
 
         sf1,sf2 = st.columns([3,1])
         with sf2:
