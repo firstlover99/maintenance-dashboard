@@ -207,6 +207,42 @@ def classify_bm_pm(row):
     if any(k in txt for k in ['예방','PM','계획정비','정기점검','P/M']): return 'PM(계획)'
     return 'BM(돌발)'
 
+# ══════════════════════════════════════════════════════
+# 실제 근무 인원 기준 리스트 (유사도 매칭 기준)
+# ══════════════════════════════════════════════════════
+from difflib import SequenceMatcher
+
+VALID_WORKERS = [
+    '정한식','이준호','박진만','이태진','최병화','송치원',
+    '김상진','최문석','강지용','최성진','노현우','임찬영',
+    '한은수','이민수','최수한','지훈태','원태양'
+]
+WORKER_MATCH_THRESHOLD = 0.65  # 유사도 임계값 (0.65 = 오타 최대 복원)
+
+def match_worker_name(name: str) -> str | None:
+    """
+    입력 이름을 VALID_WORKERS 와 유사도 비교.
+    - 완전일치 → 즉시 반환
+    - 유사도 >= WORKER_MATCH_THRESHOLD → 가장 유사한 기준 이름 반환
+    - 미달 → None (삭제 대상)
+    """
+    name = name.strip()
+    # 완전일치 우선
+    if name in VALID_WORKERS:
+        return name
+    # 유사도 비교
+    best_name  = None
+    best_score = 0.0
+    for valid in VALID_WORKERS:
+        score = SequenceMatcher(None, name, valid).ratio()
+        if score > best_score:
+            best_score = score
+            best_name  = valid
+    if best_score >= WORKER_MATCH_THRESHOLD:
+        return best_name
+    return None  # 매칭 실패 → 삭제
+
+
 def parse_workers(조치자_val):
     NOISE = {'야간','주간','주간조','야간조','주야간','업체','가동중','조치','기타'}
     if not 조치자_val or not isinstance(조치자_val, str): return []
@@ -224,7 +260,21 @@ def parse_workers(조치자_val):
     workers = [w for w in expanded if len(w) >= 2]
     workers = [w for w in workers if re.search(r'[가-힣]', w)]
     workers = [w for w in workers if w not in NOISE]
-    return workers
+    # ── 유사도 기반 이름 정규화 ─────────────────────────
+    # 기준 인원과 매칭 성공 → 표준 이름으로 교체
+    # 매칭 실패(유사도 < 0.7) → 삭제
+    matched = []
+    for w in workers:
+        std_name = match_worker_name(w)
+        if std_name:
+            matched.append(std_name)
+        # else: 매칭 실패 → 리스트에 추가하지 않음(삭제)
+    # 중복 제거 (같은 건에 동일인 중복 파싱 방지)
+    seen = []
+    for w in matched:
+        if w not in seen:
+            seen.append(w)
+    return seen
 
 
 def parse_workers_with_type(조치자_val):
@@ -1281,7 +1331,7 @@ with tab3:
         st.info("Tab1에서 데이터를 불러오고 '통합 실행'을 눌러주세요.")
     else:
         st.subheader("설비 MTTR / MTBF 분석")
-        st.caption("⚠️ MTBF는 근사값입니다 — 월~토요일 15시간 가동 적용")
+        st.caption("⚠️ MTBF는 근사값입니다 — 월~토 일15시간 가동 적용")
 
         # 전역 기간 필터 적용
         mf1, mf2, mf3 = st.columns([3, 2, 1])
