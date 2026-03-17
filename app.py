@@ -213,9 +213,14 @@ def classify_bm_pm(row):
 from difflib import SequenceMatcher
 
 VALID_WORKERS = [
+    # ── 차체팀 (기존 17명) ──────────────────────────
     '정한식','이준호','박진만','이태진','최병화','송치원',
     '김상진','최문석','강지용','최성진','노현우','임찬영',
-    '한은수','이민수','최수한','지훈태','원태양'
+    '한은수','이민수','최수한','지훈태','원태양',
+    # ── 광주공장 (추가 18명) ────────────────────────
+    '황동건','김재훈','박한빈','이기상','최영조','김동희',
+    '주태훈','신철','박리건','장성용','황장현','이창용',
+    '임대웅','이현수','심지형','박성수','김태규','차윤환',
 ]
 WORKER_MATCH_THRESHOLD = 0.65  # 유사도 임계값 (0.65 = 오타 최대 복원)
 
@@ -1082,7 +1087,7 @@ with st.expander(
                 f"({_gf_pct:.1f}% / 전체 {len(_mdf_raw):,}건)")
 
 (tab1, tab2, tab3, tab4, tab5, tab6, tab7,
- tab8, tab9, tab10, tab11, tab12, tab13, tab14) = st.tabs([
+ tab8, tab9, tab10, tab11, tab12, tab13, tab14, tab15) = st.tabs([
     "📂 데이터 불러오기",
     "📊 고장현황 (Pareto)",
     "⚙️ 설비분석 (MTTR/MTBF)",
@@ -1097,6 +1102,7 @@ with st.expander(
     "🏷️ 표준코드 분석",
     "📝 월보·주보 자동작성",
     "📥 출력",
+    "🔄 POP양식 변환",
 ])
 
 # ══════════════════════════════════════════════════════
@@ -3039,3 +3045,318 @@ with tab14:
             '3단계: 프린터 선택 → <b>PDF로 저장</b><br>'
             '4단계: 용지 → <b>A3 가로</b> 권장 / 배율 → <b>맞춤</b><br>'
             '5단계: <b>저장</b> 클릭</div>', unsafe_allow_html=True)
+
+
+# ══════════════════════════════════════════════════════
+# TAB 15 — POP양식 변환
+# ══════════════════════════════════════════════════════
+def _pop_split_line(line_raw):
+    """라인명 → 차종 / 라인 분리 (첫 공백 기준)"""
+    if not line_raw:
+        return '', ''
+    s = str(line_raw).strip()
+    parts = s.split(' ', 1)
+    return parts[0], parts[1].strip() if len(parts) > 1 else ''
+
+def _pop_calc_출동시각(정지시각, 출동시간_분):
+    """정지시각 + 출동시간(분) → 출동시각 역산"""
+    if not isinstance(정지시각, datetime):
+        return None
+    try:
+        mins = float(출동시간_분)
+        if mins < 0 or mins > 1440:
+            return 정지시각
+        return 정지시각 + timedelta(minutes=mins)
+    except (TypeError, ValueError):
+        return 정지시각
+
+def _pop_make_비고(비고_원본, 구분):
+    """비고 | 공장구분 병기"""
+    b = str(비고_원본).strip() if 비고_원본 and str(비고_원본).strip() not in ('None','nan','') else ''
+    g = str(구분).strip()      if 구분      and str(구분).strip()      not in ('None','nan','') else ''
+    if b and g:  return f"{b} | {g}"
+    if g:        return g
+    if b:        return b
+    return None
+
+def convert_pop_to_excel(df_src):
+    """
+    POP 고장이력 DataFrame → 차체 설비보전 형식 DataFrame 변환
+    입력 컬럼: 구분, 라인명, 정지시각, 출동시간, 완료시각, 소요시각,
+               설비유형, 고장설비, 고장부위, 현상, 원인, 조치, 비고, 조치자
+    """
+    OUTPUT_COLS = ['년','월','일','주','라인','라인_KEY','차종','설비유형',
+                   '고장설비','고장부위','고장부위_STD','현상','원인','조치',
+                   '소요시간','정지시각','출동시각','완료시각','조치자','비고','NO']
+
+    records = []
+    skip_cnt = 0
+
+    for no_idx, row in enumerate(df_src.itertuples(index=False), 1):
+        구분      = getattr(row, '구분',     None)
+        라인명_raw = getattr(row, '라인명',   None)
+        정지시각_v = getattr(row, '정지시각', None)
+        출동시간_v = getattr(row, '출동시간', None)
+        완료시각_v = getattr(row, '완료시각', None)
+        소요시각_v = getattr(row, '소요시각', None)
+        설비유형_v = getattr(row, '설비유형', None)
+        고장설비_v = getattr(row, '고장설비', None)
+        고장부위_v = getattr(row, '고장부위', None)
+        현상_v     = getattr(row, '현상',     None)
+        원인_v     = getattr(row, '원인',     None)
+        조치_v     = getattr(row, '조치',     None)
+        비고_v     = getattr(row, '비고',     None)
+        조치자_v   = getattr(row, '조치자',   None)
+
+        # datetime 변환
+        정지시각 = parse_dt(정지시각_v)
+        완료시각 = parse_dt(완료시각_v)
+        정지시각 = sanitize_dt(정지시각)
+        완료시각 = sanitize_dt(완료시각)
+
+        기준dt = 정지시각 or 완료시각
+        if 기준dt is None:
+            skip_cnt += 1
+            continue
+
+        출동시각 = _pop_calc_출동시각(정지시각, 출동시간_v)
+        차종, 라인 = _pop_split_line(라인명_raw)
+
+        try:
+            주 = 기준dt.isocalendar()[1]
+        except Exception:
+            주 = None
+
+        records.append({
+            '년':          기준dt.year,
+            '월':          기준dt.month,
+            '일':          기준dt.day,
+            '주':          주,
+            '라인':        라인,
+            '라인_KEY':    라인,
+            '차종':        차종,
+            '설비유형':    설비유형_v,
+            '고장설비':    고장설비_v,
+            '고장부위':    고장부위_v,
+            '고장부위_STD': 고장부위_v,
+            '현상':        현상_v,
+            '원인':        원인_v,
+            '조치':        조치_v,
+            '소요시간':    소요시각_v,
+            '정지시각':    정지시각,
+            '출동시각':    출동시각,
+            '완료시각':    완료시각,
+            '조치자':      조치자_v,
+            '비고':        _pop_make_비고(비고_v, 구분),
+            'NO':          no_idx,
+        })
+
+    df_out = pd.DataFrame(records, columns=OUTPUT_COLS)
+    return df_out, skip_cnt
+
+def pop_df_to_excel_bytes(df):
+    """변환된 DataFrame → xlsx bytes (다운로드용)"""
+    import openpyxl
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = 'Sheet1'
+
+    hdr_font   = Font(name='Arial', bold=True, color='FFFFFF', size=10)
+    hdr_fill   = PatternFill('solid', start_color='1E3A5F')
+    hdr_align  = Alignment(horizontal='center', vertical='center', wrap_text=True)
+    thin_side  = Side(style='thin', color='AAAAAA')
+    bdr        = Border(left=thin_side, right=thin_side,
+                        top=thin_side,  bottom=thin_side)
+    data_font  = Font(name='Arial', size=9)
+    data_align = Alignment(vertical='center')
+    alt_fill   = PatternFill('solid', start_color='F4F7FB')
+
+    COL_WIDTHS = [6,5,5,5,22,22,10,10,12,18,18,40,40,40,10,18,18,18,16,30,7]
+    for i, w in enumerate(COL_WIDTHS, 1):
+        ws.column_dimensions[openpyxl.utils.get_column_letter(i)].width = w
+    ws.row_dimensions[1].height = 28
+    ws.freeze_panes = 'A2'
+    ws.auto_filter.ref = f"A1:{openpyxl.utils.get_column_letter(len(df.columns))}{len(df)+1}"
+
+    # 헤더
+    for c_idx, col in enumerate(df.columns, 1):
+        cell = ws.cell(row=1, column=c_idx, value=col)
+        cell.font = hdr_font; cell.fill = hdr_fill
+        cell.alignment = hdr_align; cell.border = bdr
+
+    # 데이터
+    for r_idx, row in enumerate(df.itertuples(index=False), 2):
+        is_alt = (r_idx % 2 == 0)
+        for c_idx, val in enumerate(row, 1):
+            v = None if (isinstance(val, float) and pd.isna(val)) else val
+            cell = ws.cell(row=r_idx, column=c_idx, value=v)
+            cell.font = data_font; cell.border = bdr
+            cell.alignment = data_align
+            if is_alt: cell.fill = alt_fill
+            if c_idx in (16,17,18) and isinstance(v, datetime):
+                cell.number_format = 'YYYY-MM-DD HH:MM:SS'
+            if c_idx == 15 and v is not None:
+                cell.number_format = '#,##0.0'
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf.getvalue()
+
+with tab15:
+    st.markdown('<div class="main-title">🔄 POP양식 변환</div>', unsafe_allow_html=True)
+    st.markdown('<div class="sub-title">POP 고장이력(광주) → 차체 설비보전 형식으로 변환</div>',
+                unsafe_allow_html=True)
+
+    # ── 입력 컬럼 안내 ──────────────────────────────
+    with st.expander("📋 입력 파일 컬럼 형식 안내", expanded=False):
+        st.markdown("""
+| 순서 | 컬럼명 | 설명 |
+|---:|---|---|
+| 1 | 구분 | 공장/동 구분 (예: 하남공장 7동) |
+| 2 | 라인명 | 차종+라인 포함 (예: NQ5 RR FLR COMPL) |
+| 3 | 정지시각 | datetime (YYYY-MM-DD HH:MM:SS) |
+| 4 | 출동시간 | 숫자(분) — 정지시각 기준 역산 |
+| 5 | 완료시각 | datetime |
+| 6 | 소요시각 | 숫자(분) |
+| 7 | 설비유형 | 로봇 / 지그 / 생산 등 |
+| 8 | 고장설비 | R03, A01 등 |
+| 9 | 고장부위 | 일시정지, 에러 등 |
+| 10 | 현상 | 고장 현상 설명 |
+| 11 | 원인 | 고장 원인 |
+| 12 | 조치 | 조치 내용 |
+| 13 | 비고 | 비고 (없으면 공백) |
+| 14 | 조치자 | 담당자 이름 |
+        """)
+
+    st.divider()
+
+    # ── 파일 업로드 ──────────────────────────────────
+    pop_file = st.file_uploader(
+        "📂 POP 고장이력 파일 업로드 (.xlsx)",
+        type=['xlsx'],
+        key='pop_uploader',
+        help="광주공장 POP 시스템 고장이력 엑셀 파일을 업로드하세요."
+    )
+
+    if pop_file is not None:
+        try:
+            with st.spinner("파일 읽는 중..."):
+                df_pop_raw = pd.read_excel(pop_file, sheet_name=0, header=0)
+
+            # 컬럼명 강제 지정 (순서 기반)
+            POP_COLS = ['구분','라인명','정지시각','출동시간','완료시각','소요시각',
+                        '설비유형','고장설비','고장부위','현상','원인','조치','비고','조치자']
+            if len(df_pop_raw.columns) >= len(POP_COLS):
+                df_pop_raw.columns = POP_COLS + list(df_pop_raw.columns[len(POP_COLS):])
+            else:
+                st.markdown(
+                    f'<div class="err-box">❌ 컬럼 수 부족 — '
+                    f'필요: {len(POP_COLS)}개 / 실제: {len(df_pop_raw.columns)}개</div>',
+                    unsafe_allow_html=True)
+                st.stop()
+
+            total_raw = len(df_pop_raw)
+
+            # ── 원본 미리보기 ──────────────────────
+            st.markdown("#### 📄 원본 데이터 미리보기 (상위 5행)")
+            st.dataframe(df_pop_raw.head(5), use_container_width=True)
+
+            st.markdown(
+                f'<div class="ok-box">✅ 파일 로드 완료 — 총 <b>{total_raw:,}행</b></div>',
+                unsafe_allow_html=True)
+
+            st.divider()
+
+            # ── 변환 실행 ──────────────────────────
+            if st.button("⚡ 변환 실행", use_container_width=True, key='pop_convert_btn',
+                         type='primary'):
+                with st.spinner(f"변환 중... ({total_raw:,}행)"):
+                    df_converted, skip_cnt = convert_pop_to_excel(df_pop_raw)
+
+                st.session_state['pop_converted_df']  = df_converted
+                st.session_state['pop_skip_cnt']      = skip_cnt
+                st.session_state['pop_total_raw']     = total_raw
+                st.session_state['pop_source_fname']  = pop_file.name
+
+        except Exception as e:
+            st.markdown(f'<div class="err-box">❌ 파일 읽기 오류: {e}</div>',
+                        unsafe_allow_html=True)
+
+    # ── 변환 결과 표시 ───────────────────────────────
+    if st.session_state.get('pop_converted_df') is not None:
+        df_conv   = st.session_state['pop_converted_df']
+        skip_cnt  = st.session_state['pop_skip_cnt']
+        total_raw = st.session_state['pop_total_raw']
+        fname     = st.session_state.get('pop_source_fname', '')
+
+        conv_cnt  = len(df_conv)
+
+        st.divider()
+        st.markdown("#### 📊 변환 결과 통계")
+
+        sc1, sc2, sc3 = st.columns(3)
+        sc1.metric("원본 행수",   f"{total_raw:,}행")
+        sc2.metric("변환 성공",   f"{conv_cnt:,}행",
+                   f"-{skip_cnt}행 (날짜없음 제외)" if skip_cnt > 0 else "전량 변환")
+        sc3.metric("Skip(날짜없음)", f"{skip_cnt}행")
+
+        # 공장별 건수
+        if '비고' in df_conv.columns:
+            st.markdown("##### 공장별 건수")
+            def _extract_plant(b):
+                if not b: return '(미상)'
+                parts = str(b).split('|')
+                return parts[-1].strip() if parts else '(미상)'
+            plant_cnt = df_conv['비고'].apply(_extract_plant).value_counts().reset_index()
+            plant_cnt.columns = ['공장구분','건수']
+            st.dataframe(plant_cnt, use_container_width=True, hide_index=True)
+
+        # 설비유형별 건수
+        if '설비유형' in df_conv.columns:
+            st.markdown("##### 설비유형별 건수")
+            eq_cnt = df_conv['설비유형'].value_counts().reset_index()
+            eq_cnt.columns = ['설비유형','건수']
+            st.dataframe(eq_cnt, use_container_width=True, hide_index=True)
+
+        st.divider()
+
+        # ── 변환 결과 미리보기 ──────────────────────
+        st.markdown("#### 🔍 변환 결과 미리보기 (상위 20행)")
+        st.dataframe(df_conv.head(20), use_container_width=True)
+
+        st.divider()
+
+        # ── 다운로드 ────────────────────────────────
+        st.markdown("#### ⬇️ 변환 파일 다운로드")
+
+        with st.spinner("Excel 파일 생성 중..."):
+            excel_bytes = pop_df_to_excel_bytes(df_conv)
+
+        out_fname = fname.replace('.xlsx','').replace('.XLSX','')
+        out_fname = f"{out_fname}_차체형식변환_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
+
+        st.download_button(
+            label=f"📥 변환 파일 다운로드 ({conv_cnt:,}행)",
+            data=excel_bytes,
+            file_name=out_fname,
+            mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            use_container_width=True,
+            type='primary',
+        )
+
+        st.markdown(
+            '<div class="ok-box">'
+            '✅ 변환 완료 — 다운로드 후 <b>보전팀 통합 분석 시스템 Tab1</b>에서 '
+            '"로봇/지그" 파일로 업로드하여 분석하세요.'
+            '</div>',
+            unsafe_allow_html=True)
+
+    elif pop_file is None:
+        st.markdown(
+            '<div class="warn-box">'
+            '⬆️ POP 고장이력 xlsx 파일을 업로드하면 변환을 시작할 수 있습니다.'
+            '</div>',
+            unsafe_allow_html=True)
