@@ -546,6 +546,7 @@ def load_press(file_obj):
     return _enrich_codes(df)
 
 def load_robot(file_obj):
+    file_obj.seek(0)  # 파일 포지션 초기화
     df = pd.read_excel(file_obj, sheet_name='Sheet1', header=0)
     df.columns = ['발생일시_raw','월','일','주','라인','라인_KEY','차종','설비유형',
                   '고장설비','고장부위','고장부위_STD','현상','원인','조치',
@@ -1186,24 +1187,35 @@ with tab1:
         st.markdown("#### ② 직접 파일 업로드 (.xlsx / .csv)")
         uploaded = st.file_uploader("파일 선택 (여러 파일 동시 가능)",
                                     type=['xlsx','csv'], accept_multiple_files=True)
+        # ── 파일 업로드 처리 (중복 재처리 방지) ───────────────────────
         if uploaded:
+            _loaded_ids = st.session_state.get('_loaded_file_ids', {})
             for uf in uploaded:
+                if uf.name.endswith('.csv'):
+                    st.info(f"CSV '{uf.name}' — xlsx 권장")
+                    continue
+                _fid = f"{uf.name}_{uf.size}"
+                if _fid in _loaded_ids:
+                    continue  # 이미 처리한 파일 — 재처리 건너뜀
                 with st.spinner(f"{uf.name} 처리 중..."):
                     try:
-                        if uf.name.endswith('.csv'):
-                            st.info(f"CSV '{uf.name}' — xlsx 권장")
+                        file_buf = io.BytesIO(uf.read())  # BytesIO로 버퍼링
+                        result, ftype = detect_and_load(file_buf, uf.name)
+                        if ftype == 'press':
+                            st.session_state.press_df = result
+                            _loaded_ids[_fid] = 'press'
+                            st.success(f"✅ 프레스 '{uf.name}' — {len(result):,}건")
+                        elif ftype == 'robot':
+                            st.session_state.robot_df = result
+                            _loaded_ids[_fid] = 'robot'
+                            st.success(f"✅ 로봇/지그 '{uf.name}' — {len(result):,}건")
                         else:
-                            result, ftype = detect_and_load(uf, uf.name)
-                            if ftype == 'press':
-                                st.session_state.press_df = result
-                                st.success(f"✅ 프레스 '{uf.name}' — {len(result):,}건")
-                            elif ftype == 'robot':
-                                st.session_state.robot_df = result
-                                st.success(f"✅ 로봇/지그 '{uf.name}' — {len(result):,}건")
-                            else:
-                                st.warning(f"'{uf.name}' 형식 인식 실패: {ftype}")
+                            st.warning(f"'{uf.name}' 형식 인식 실패: {ftype}")
                     except Exception as e:
                         st.error(f"'{uf.name}' 처리 오류: {e}")
+            st.session_state['_loaded_file_ids'] = _loaded_ids
+        else:
+            st.session_state['_loaded_file_ids'] = {}  # 업로더 비워지면 ID 초기화
 
     st.divider()
 
