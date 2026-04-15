@@ -43,6 +43,29 @@ st.markdown("""
     .code-badge {display:inline-block; background:#e8f4fd; color:#1a5276;
                  border-radius:4px; padding:2px 7px; font-size:11px;
                  font-weight:600; margin:2px;}
+    /* ── 예방정비 호버 툴팁 ─────────────────────── */
+    .pm-card { position:relative; cursor:default; }
+    .pm-tooltip {
+        display:none; position:absolute; z-index:9999;
+        background:#fff; border:1px solid #d0d0d0;
+        border-radius:8px; padding:12px 16px;
+        min-width:340px; max-width:480px;
+        left:0; top:105%;
+        box-shadow:0 6px 20px rgba(0,0,0,.15);
+        font-size:12px; line-height:2.0;
+        pointer-events:none;
+    }
+    .pm-card:hover .pm-tooltip { display:block; }
+    /* ── 인쇄/PDF 잘림 방지 ─────────────────────── */
+    @media print {
+        section[data-testid="stSidebar"] { display:none !important; }
+        .block-container { padding:0 !important; max-width:100% !important; }
+        .stApp, .main, [data-testid="stAppViewContainer"]
+            { overflow:visible !important; height:auto !important; }
+        .card-red,.card-org,.card-grn { page-break-inside:avoid; }
+        .stPlotlyChart { page-break-inside:avoid; }
+        @page { size:A4; margin:15mm; }
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -1266,6 +1289,32 @@ with tab2:
                          f'<div class="kpi-label">{label}</div></div>', unsafe_allow_html=True)
         st.divider()
 
+        # ── hover helper: 그룹 기준 ─────────────────────
+        def _tf_grp(group_col, group_val, src_df):
+            sub = src_df[src_df[group_col] == group_val]
+            cols = [c for c in ['고장부위','현상'] if c in sub.columns]
+            if not cols: return '-'
+            if len(cols) == 2:
+                fk = sub['고장부위'].fillna('').str.strip() + ' / ' + sub['현상'].fillna('').str.strip()
+                fk = fk[(sub['고장부위'].notna() & (sub['고장부위'].str.strip()!='')) |
+                        (sub['현상'].notna() & (sub['현상'].str.strip()!=''))]
+                fk = fk.str.strip(' /').str.strip()
+            else:
+                fk = sub[cols[0]].dropna()
+                fk = fk[fk.str.strip() != '']
+            if fk.empty: return '-'
+            top = fk.value_counts().head(3)
+            return '<br>'.join([f'  {i+1}. {str(k)[:30]} ({v}건)' for i,(k,v) in enumerate(top.items())]) or '-'
+
+        def _te_grp(group_col, group_val, src_df):
+            sub = src_df[src_df[group_col] == group_val]
+            if '고장설비' not in sub.columns: return '-'
+            col = sub['고장설비'].dropna()
+            col = col[col.str.strip() != '']
+            if col.empty: return '-'
+            top = col.value_counts().head(3)
+            return '<br>'.join([f'  {i+1}. {k} ({v}건)' for i,(k,v) in enumerate(top.items())]) or '-'
+
         p1,p2 = st.columns(2)
         with p1:
             st.markdown("##### 설비유형별 Pareto — 건수")
@@ -1274,10 +1323,12 @@ with tab2:
                    .reset_index().sort_values('건수',ascending=False).head(top_n))
             grp['누적%'] = (grp['건수'].cumsum()/grp['건수'].sum()*100).round(1)
             grp['평균MTTR'] = (grp['총정지시간']/grp['건수']).round(1)
+            grp['_tf'] = grp['설비유형'].apply(lambda v: _tf_grp('설비유형', v, fdf))
+            grp['_te'] = grp['설비유형'].apply(lambda v: _te_grp('설비유형', v, fdf))
             fig = make_subplots(specs=[[{"secondary_y":True}]])
             fig.add_trace(go.Bar(x=grp['설비유형'],y=grp['건수'],name='건수',
                                  marker_color='#1e3a5f',
-                                 customdata=np.stack([grp['총정지시간'],grp['평균MTTR'],grp['누적%']],axis=-1),
+                                 customdata=np.stack([grp['총정지시간'],grp['평균MTTR'],grp['누적%'],grp['_tf'],grp['_te']],axis=-1),
                                  hovertemplate='<b>%{x}</b><br>건수: %{y:,}건<br>총정지: %{customdata[0]:.0f}분<br>평균MTTR: %{customdata[1]:.1f}분<br>누적: %{customdata[2]:.1f}%<extra></extra>'),secondary_y=False)
             fig.add_trace(go.Scatter(x=grp['설비유형'],y=grp['누적%'],name='누적%',
                                      line=dict(color='#e74c3c',width=2),mode='lines+markers',
@@ -1294,10 +1345,12 @@ with tab2:
                     .reset_index().sort_values('총정지시간',ascending=False).head(top_n))
             grp2['누적%'] = (grp2['총정지시간'].cumsum()/grp2['총정지시간'].sum()*100).round(1)
             grp2['평균MTTR'] = (grp2['총정지시간']/grp2['건수']).round(1)
+            grp2['_tf'] = grp2['설비유형'].apply(lambda v: _tf_grp('설비유형', v, fdf))
+            grp2['_te'] = grp2['설비유형'].apply(lambda v: _te_grp('설비유형', v, fdf))
             fig2 = make_subplots(specs=[[{"secondary_y":True}]])
             fig2.add_trace(go.Bar(x=grp2['설비유형'],y=grp2['총정지시간'],name='정지시간(분)',
                                   marker_color='#c0392b',
-                                  customdata=np.stack([grp2['건수'],grp2['평균MTTR'],grp2['누적%']],axis=-1),
+                                  customdata=np.stack([grp2['건수'],grp2['평균MTTR'],grp2['누적%'],grp2['_tf'],grp2['_te']],axis=-1),
                                   hovertemplate='<b>%{x}</b><br>정지: %{y:,.0f}분<br>건수: %{customdata[0]}건<br>평균MTTR: %{customdata[1]:.1f}분<br>누적: %{customdata[2]:.1f}%<extra></extra>'),secondary_y=False)
             fig2.add_trace(go.Scatter(x=grp2['설비유형'],y=grp2['누적%'],name='누적%',
                                       line=dict(color='#e67e22',width=2),mode='lines+markers'),secondary_y=True)
@@ -1419,21 +1472,52 @@ with tab3:
                            help="출동시각~완료시각 합산")
                 st.divider()
 
+                # ── hover helper: 설비_KEY 기준 ────────────────────
+                def _tf_key(key, src_df):
+                    sub = src_df[src_df['설비_KEY'] == key] if '설비_KEY' in src_df.columns else src_df.iloc[0:0]
+                    cols = [c for c in ['고장부위','현상'] if c in sub.columns]
+                    if not cols: return '-'
+                    if len(cols) == 2:
+                        fk = sub['고장부위'].fillna('').str.strip() + ' / ' + sub['현상'].fillna('').str.strip()
+                        fk = fk[(sub['고장부위'].notna() & (sub['고장부위'].str.strip()!='')) |
+                                (sub['현상'].notna() & (sub['현상'].str.strip()!=''))]
+                        fk = fk.str.strip(' /').str.strip()
+                    else:
+                        fk = sub[cols[0]].dropna()
+                        fk = fk[fk.str.strip() != '']
+                    if fk.empty: return '-'
+                    top = fk.value_counts().head(3)
+                    return '<br>'.join([f'  {i+1}. {str(k)[:30]} ({v}건)' for i,(k,v) in enumerate(top.items())]) or '-'
+
+                def _te_key(key, src_df):
+                    sub = src_df[src_df['설비_KEY'] == key] if '설비_KEY' in src_df.columns else src_df.iloc[0:0]
+                    if '조치자' not in sub.columns: return '-'
+                    col = sub['조치자'].dropna()
+                    col = col[col.astype(str).str.strip() != '']
+                    if col.empty: return '-'
+                    top = col.value_counts().head(3)
+                    return '<br>'.join([f'  {i+1}. {str(k)} ({v}건)' for i,(k,v) in enumerate(top.items())]) or '-'
+
                 # ── MTTR 상위 차트 ────────────────────────
-                m_top = mttr_df.head(top_m)
+                m_top = mttr_df.head(top_m).copy()
+                m_top['_tf'] = m_top['설비_KEY'].apply(lambda k: _tf_key(k, mdf))
+                m_top['_te'] = m_top['설비_KEY'].apply(lambda k: _te_key(k, mdf))
                 st.markdown(f"##### MTTR 상위 {top_m}개 (평균수리시간 긴 순)")
                 fig_mttr = px.bar(
                     m_top.sort_values('MTTR(분)'),
                     x='MTTR(분)', y='설비_KEY', orientation='h', color='라인',
                     custom_data=['라인', '고장설비', '전체건수', 'BM건수',
-                                 'MTBF_근사(시간)', '총정지시간(분)', '설비유형'])
+                                 'MTBF_근사(시간)', '총정지시간(분)', '설비유형', '_tf', '_te'])
                 fig_mttr.update_traces(
                     texttemplate='%{x:.0f}분', textposition='outside',
                     hovertemplate=(
                         '<b>%{y}</b><br>유형: %{customdata[6]}<br>'
                         'MTTR: %{x:.1f}분<br>MTBF(근사): %{customdata[4]}시간<br>'
                         '전체: %{customdata[2]}건 / BM: %{customdata[3]}건<br>'
-                        '총정지: %{customdata[5]:.0f}분<extra></extra>'))
+                        '총정지: %{customdata[5]:.0f}분<br>'
+                        '<b>▶ 반복 고장 Top 3 (부위/현상)</b><br>%{customdata[7]}<br>'
+                        '<b>▶ 주요 조치자 Top 3</b><br>%{customdata[8]}'
+                        '<extra></extra>'))
                 fig_mttr.update_layout(
                     height=max(420, len(m_top)*28),
                     margin=dict(t=30, b=20), yaxis_title='')
@@ -1456,6 +1540,8 @@ with tab3:
 
                     mtbf_data = mtbf_data.copy()
                     mtbf_data['MTBF등급'] = mtbf_data['MTBF_근사(시간)'].apply(_mtbf_color)
+                    mtbf_data['_tf'] = mtbf_data['설비_KEY'].apply(lambda k: _tf_key(k, mdf))
+                    mtbf_data['_te'] = mtbf_data['설비_KEY'].apply(lambda k: _te_key(k, mdf))
                     color_map_mtbf = {
                         '🔴 데이터확인필요': '#e74c3c',
                         '🟠 위험':           '#e67e22',
@@ -1467,14 +1553,17 @@ with tab3:
                         orientation='h', color='MTBF등급',
                         color_discrete_map=color_map_mtbf,
                         custom_data=['라인', '고장설비', 'BM건수',
-                                     '클러스터건수(BM)', 'MTTR(분)', '설비유형', 'MTBF등급'])
+                                     '클러스터건수(BM)', 'MTTR(분)', '설비유형', 'MTBF등급', '_tf', '_te'])
                     fig_mtbf.update_traces(
                         texttemplate='%{x:.1f}h', textposition='outside',
                         hovertemplate=(
                             '<b>%{y}</b><br>MTBF(근사): %{x:.1f}시간<br>'
                             '등급: %{customdata[6]}<br>'
                             'BM건수: %{customdata[2]}건 → 클러스터: %{customdata[3]}건<br>'
-                            'MTTR: %{customdata[4]:.1f}분<extra></extra>'))
+                            'MTTR: %{customdata[4]:.1f}분<br>'
+                                        '<b>▶ 반복 고장 Top 3 (부위/현상)</b><br>%{customdata[7]}<br>'
+                                        '<b>▶ 주요 조치자 Top 3</b><br>%{customdata[8]}'
+                                        '<extra></extra>'))
                     fig_mtbf.update_layout(
                         height=max(420, len(mtbf_data)*28),
                         margin=dict(t=30, b=20), yaxis_title='',
@@ -1496,11 +1585,13 @@ with tab3:
                 st.markdown("##### MTTR vs MTBF(근사) 산점도")
                 scatter_d = mttr_df[mttr_df['MTBF_근사(시간)'].notna()].copy()
                 if not scatter_d.empty:
+                    scatter_d['_tf'] = scatter_d['설비_KEY'].apply(lambda k: _tf_key(k, mdf))
+                    scatter_d['_te'] = scatter_d['설비_KEY'].apply(lambda k: _te_key(k, mdf))
                     fig_sc = px.scatter(
                         scatter_d, x='MTBF_근사(시간)', y='MTTR(분)',
                         color='라인', size='전체건수', hover_name='설비_KEY',
                         custom_data=['라인', '고장설비', '전체건수',
-                                     '총정지시간(분)', '설비유형'],
+                                     '총정지시간(분)', '설비유형', '_tf', '_te'],
                         labels={
                             'MTBF_근사(시간)': 'MTBF 근사(시간, 길수록 안전)',
                             'MTTR(분)': 'MTTR(분, 낮을수록 좋음)'})
@@ -1510,6 +1601,16 @@ with tab3:
                                      annotation_text=f'MTBF 중앙값 {mtbf_med:.0f}h')
                     fig_sc.add_hline(y=mttr_med, line_dash='dash', line_color='gray',
                                      annotation_text=f'MTTR 중앙값 {mttr_med:.0f}분')
+                    fig_sc.update_traces(
+                        hovertemplate=(
+                            '<b>%{hovertext}</b><br>'
+                            'MTBF: %{x:.1f}시간 | MTTR: %{y:.1f}분<br>'
+                            '전체: %{customdata[2]}건 | 총정지: %{customdata[3]:.0f}분<br>'
+                            '<b>▶ 반복 고장 Top 3 (부위/현상)</b><br>%{customdata[5]}<br>'
+                            '<b>▶ 주요 조치자 Top 3</b><br>%{customdata[6]}'
+                            '<extra></extra>'
+                        )
+                    )
                     fig_sc.update_layout(height=460, margin=dict(t=30, b=20))
                     st.plotly_chart(fig_sc, use_container_width=True)
 
@@ -1616,6 +1717,35 @@ with tab4:
             st.caption("협업 비율 높음 → 난이도 높은 고장 전문가 또는 추가 교육 필요 대상")
             top20 = person_agg.head(20).copy()
 
+            # ── hover helper: 조치자 기준 ──────────────────────────
+            def _tf_worker(worker, src_df):
+                sub = src_df[src_df['조치자'] == worker] if '조치자' in src_df.columns else src_df.iloc[0:0]
+                cols = [c for c in ['고장부위','현상'] if c in sub.columns]
+                if not cols: return '-'
+                if len(cols) == 2:
+                    fk = sub['고장부위'].fillna('').str.strip() + ' / ' + sub['현상'].fillna('').str.strip()
+                    fk = fk[(sub['고장부위'].notna() & (sub['고장부위'].str.strip()!='')) |
+                            (sub['현상'].notna() & (sub['현상'].str.strip()!=''))]
+                    fk = fk.str.strip(' /').str.strip()
+                else:
+                    fk = sub[cols[0]].dropna()
+                    fk = fk[fk.str.strip() != '']
+                if fk.empty: return '-'
+                top = fk.value_counts().head(3)
+                return '<br>'.join([f'  {i+1}. {str(k)[:30]} ({v}건)' for i,(k,v) in enumerate(top.items())]) or '-'
+
+            def _te_worker(worker, src_df):
+                sub = src_df[src_df['조치자'] == worker] if '조치자' in src_df.columns else src_df.iloc[0:0]
+                if '설비_KEY' not in sub.columns: return '-'
+                col = sub['설비_KEY'].dropna()
+                col = col[col.astype(str).str.strip() != '']
+                if col.empty: return '-'
+                top = col.value_counts().head(3)
+                return '<br>'.join([f'  {i+1}. {k} ({v}건)' for i,(k,v) in enumerate(top.items())]) or '-'
+
+            top20['_tf'] = top20['조치자'].apply(lambda w: _tf_worker(w, worker_df))
+            top20['_te'] = top20['조치자'].apply(lambda w: _te_worker(w, worker_df))
+
             fig_stack = go.Figure()
             fig_stack.add_trace(go.Bar(
                 name='단독 출동',
@@ -1623,14 +1753,16 @@ with tab4:
                 marker_color='#1e3a5f',
                 text=top20['단독콜'],
                 textposition='inside',
-                hovertemplate='<b>%{x}</b><br>단독콜: %{y}건<extra></extra>'))
+                customdata=top20[['단독콜','_tf','_te']].values,
+                hovertemplate='<b>%{x}</b><br>단독콜: %{y}건<br><b>▶ 주요 고장유형 Top 3</b><br>%{customdata[1]}<br><b>▶ 담당 설비 Top 3</b><br>%{customdata[2]}<extra></extra>'))
             fig_stack.add_trace(go.Bar(
                 name='협업 출동',
                 x=top20['조치자'], y=top20['협업콜'],
                 marker_color='#e67e22',
                 text=top20['협업콜'],
                 textposition='inside',
-                hovertemplate='<b>%{x}</b><br>협업콜: %{y}건<extra></extra>'))
+                customdata=top20[['협업콜','_tf','_te']].values,
+                hovertemplate='<b>%{x}</b><br>협업콜: %{y}건<br><b>▶ 주요 고장유형 Top 3</b><br>%{customdata[1]}<br><b>▶ 담당 설비 Top 3</b><br>%{customdata[2]}<extra></extra>'))
             fig_stack.update_layout(
                 barmode='stack', height=420,
                 margin=dict(t=30, b=60),
@@ -1655,13 +1787,16 @@ with tab4:
                 fig_p2 = px.bar(
                     top20, x='조치자', y='총소요시간_시',
                     color='총소요시간_시', color_continuous_scale='Reds',
-                    custom_data=['출동건수', '평균소요시간_분', '협업비율(%)'])
+                    custom_data=['출동건수', '평균소요시간_분', '협업비율(%)', '_tf', '_te'])
                 fig_p2.update_traces(
                     texttemplate='%{y:.0f}h', textposition='outside',
                     hovertemplate=(
                         '<b>%{x}</b><br>총소요: %{y:.1f}시간<br>'
                         '출동: %{customdata[0]}건<br>'
-                        '협업비율: %{customdata[2]:.1f}%<extra></extra>'))
+                        '협업비율: %{customdata[2]:.1f}%<br>'
+                        '<b>▶ 주요 고장유형 Top 3</b><br>%{customdata[3]}<br>'
+                        '<b>▶ 담당 설비 Top 3</b><br>%{customdata[4]}'
+                        '<extra></extra>'))
                 fig_p2.update_layout(height=400, margin=dict(t=20, b=60),
                                      showlegend=False, xaxis_tickangle=-30)
                 st.plotly_chart(fig_p2, use_container_width=True)
@@ -1670,17 +1805,22 @@ with tab4:
                 st.markdown("##### 협업 비율 순위")
                 coop_top = person_agg[person_agg['출동건수'] >= 3].sort_values(
                     '협업비율(%)', ascending=False).head(20)
+                coop_top['_tf'] = coop_top['조치자'].apply(lambda w: _tf_worker(w, worker_df))
+                coop_top['_te'] = coop_top['조치자'].apply(lambda w: _te_worker(w, worker_df))
                 fig_coop = px.bar(
                     coop_top, x='조치자', y='협업비율(%)',
                     color='협업비율(%)', color_continuous_scale='Oranges',
-                    custom_data=['출동건수', '단독콜', '협업콜'])
+                    custom_data=['출동건수', '단독콜', '협업콜', '_tf', '_te'])
                 fig_coop.add_hline(y=50, line_dash='dash', line_color='red',
                                    annotation_text='50% 기준선')
                 fig_coop.update_traces(
                     texttemplate='%{y:.0f}%', textposition='outside',
                     hovertemplate=(
                         '<b>%{x}</b><br>협업비율: %{y:.1f}%<br>'
-                        '단독: %{customdata[1]}건 / 협업: %{customdata[2]}건<extra></extra>'))
+                        '단독: %{customdata[1]}건 / 협업: %{customdata[2]}건<br>'
+                        '<b>▶ 주요 고장유형 Top 3</b><br>%{customdata[3]}<br>'
+                        '<b>▶ 담당 설비 Top 3</b><br>%{customdata[4]}'
+                        '<extra></extra>'))
                 fig_coop.update_layout(height=400, margin=dict(t=20, b=60),
                                        showlegend=False, xaxis_tickangle=-30)
                 st.plotly_chart(fig_coop, use_container_width=True)
@@ -1946,13 +2086,45 @@ with tab5:
         st.divider()
 
         risk_top['설비KEY'] = risk_top['라인_차종'].astype(str) + ' | ' + risk_top['고장설비'].astype(str)
+
+        def _tf_risk(row, src_df):
+            sub = src_df[(src_df['라인_차종']==row['라인_차종']) & (src_df['고장설비']==row['고장설비'])]
+            cols = [c for c in ['고장부위','현상'] if c in sub.columns]
+            if not cols: return '-'
+            if len(cols) == 2:
+                fk = sub['고장부위'].fillna('').str.strip() + ' / ' + sub['현상'].fillna('').str.strip()
+                fk = fk[(sub['고장부위'].notna() & (sub['고장부위'].str.strip()!='')) |
+                        (sub['현상'].notna() & (sub['현상'].str.strip()!=''))]
+                fk = fk.str.strip(' /').str.strip()
+            else:
+                fk = sub[cols[0]].dropna()
+                fk = fk[fk.str.strip() != '']
+            if fk.empty: return '-'
+            top = fk.value_counts().head(3)
+            return '<br>'.join([f'  {i+1}. {str(k)[:30]} ({v}건)' for i,(k,v) in enumerate(top.items())]) or '-'
+
+        def _te_risk(row, src_df):
+            sub = src_df[(src_df['라인_차종']==row['라인_차종']) & (src_df['고장설비']==row['고장설비'])]
+            if '조치자' not in sub.columns: return '-'
+            col = sub['조치자'].dropna()
+            col = col[col.astype(str).str.strip() != '']
+            if col.empty: return '-'
+            top = col.value_counts().head(3)
+            return '<br>'.join([f'  {i+1}. {str(k)} ({v}건)' for i,(k,v) in enumerate(top.items())]) or '-'
+
+        risk_top = risk_top.copy()
+        risk_top['_tf'] = risk_top.apply(lambda r: _tf_risk(r, rdf), axis=1)
+        risk_top['_te'] = risk_top.apply(lambda r: _te_risk(r, rdf), axis=1)
         color_map = {'🔴 위험':'#e74c3c','🟠 주의':'#e67e22','🟢 양호':'#27ae60'}
         fig_risk = px.bar(risk_top.sort_values('위험도점수'),x='위험도점수',y='설비KEY',orientation='h',
                           color='등급',color_discrete_map=color_map,
-                          custom_data=['건수','총정지시간','평균MTTR','설비유형'])
+                          custom_data=['건수','총정지시간','평균MTTR','설비유형','_tf','_te'])
         fig_risk.update_traces(
             hovertemplate=('<b>%{y}</b><br>위험도: %{x:.1f}점<br>설비유형: %{customdata[3]}<br>'
-                           '건수: %{customdata[0]}건<br>총정지: %{customdata[1]:,.0f}분<extra></extra>'))
+                           '건수: %{customdata[0]}건<br>총정지: %{customdata[1]:,.0f}분<br>'
+            '<b>▶ 반복 고장 Top 3 (부위/현상)</b><br>%{customdata[4]}<br>'
+            '<b>▶ 주요 조치자 Top 3</b><br>%{customdata[5]}'
+            '<extra></extra>'))
         fig_risk.update_layout(height=max(480,top_n_r*26),margin=dict(t=50,b=20,l=10,r=20),
                                 legend=dict(orientation='h',y=1.0,x=0,yanchor='bottom',xanchor='left'))
         st.plotly_chart(fig_risk,use_container_width=True)
@@ -2077,16 +2249,39 @@ with tab7:
             pk4.metric("평균 고장주기",f"{pm['고장주기_일'].mean():.0f}일")
             st.divider()
 
+            # ── 현상/원인 Top3 조회 helper ─────────────────────
+            def _fault_detail_html(row, src_df):
+                mask = ((src_df['라인_차종']==row['라인_차종']) &
+                        (src_df['고장설비']==row['고장설비']))
+                if '고장부위' in src_df.columns:
+                    mask = mask & (src_df['고장부위']==row['고장부위'])
+                sub = src_df[mask]
+                def _top3(col):
+                    if col not in sub.columns: return '데이터 없음'
+                    c = sub[col].dropna(); c = c[c.astype(str).str.strip()!='']
+                    if c.empty: return '데이터 없음'
+                    top = c.value_counts().head(3)
+                    return '<br>'.join([f'&nbsp;&nbsp;{i+1}. {str(k)[:35]} ({v}건)' for i,(k,v) in enumerate(top.items())])
+                ph = _top3('현상'); ca = _top3('원인')
+                return (f'<b>🔍 고장 현상 Top 3</b><br>{ph}<br>'
+                        f'<b>🔍 주요 원인 Top 3</b><br>{ca}')
+
             urgent = pm[pm['우선순위']=='🔴 즉시조치'].head(10)
             if len(urgent):
                 st.markdown("##### 🔴 즉시조치 대상")
                 for idx,row in urgent.iterrows():
-                    st.markdown(f'<div class="card-red"><b>#{idx} {row["라인_차종"]} | {row["고장설비"]}</b>'
-                                f' <span style="color:#888;font-size:12px">{row["설비유형"]}</span><br>'
-                                f'고장 <b>{row["건수"]}건</b> / 총정지 <b>{row["총정지시간"]:.0f}분</b> / '
-                                f'평균MTTR <b>{row["평균MTTR"]}분</b> / 고장주기 <b>{row["고장주기_일"]}일</b><br>'
-                                f'<span style="color:#c0392b"><b>📌 추천:</b> {row["추천조치"]}</span></div>',
-                                unsafe_allow_html=True)
+                    detail_html = _fault_detail_html(row, pdf_v)
+                    st.markdown(
+                        f'<div class="card-red pm-card">'
+                        f'<b>#{idx} {row["라인_차종"]} | {row["고장설비"]}</b>'
+                        f' <span style="color:#888;font-size:12px">{row["설비유형"]}</span>'
+                        f' &nbsp;<span style="color:#2471a3;font-size:11px">(마우스 올리면 상세보기)</span><br>'
+                        f'고장 <b>{row["건수"]}건</b> / 총정지 <b>{row["총정지시간"]:.0f}분</b> / '
+                        f'평균MTTR <b>{row["평균MTTR"]}분</b> / 고장주기 <b>{row["고장주기_일"]}일</b><br>'
+                        f'<span style="color:#c0392b"><b>📌 추천:</b> {row["추천조치"]}</span>'
+                        f'<div class="pm-tooltip">{detail_html}</div>'
+                        f'</div>',
+                        unsafe_allow_html=True)
 
             with st.expander("📋 예방정비 추천 전체 목록"):
                 show_pm = pm[['우선순위','우선순위점수','라인_차종','고장설비','설비유형',
@@ -2588,12 +2783,44 @@ with tab11:
 
         top_recur = eq_recur.head(25)
         color_map_r = {'🔴 매우위험':'#e74c3c','🟠 위험':'#e67e22','🟡 주의':'#f1c40f','🟢 양호':'#27ae60'}
+        # ── hover helper (TAB11 재발) ───────────────────────
+        def _tf_rr(key, src_df):
+            sub = src_df[src_df['설비_KEY'] == key] if '설비_KEY' in src_df.columns else src_df.iloc[0:0]
+            cols = [c for c in ['고장부위','현상'] if c in sub.columns]
+            if not cols: return '-'
+            if len(cols) == 2:
+                fk = sub['고장부위'].fillna('').str.strip() + ' / ' + sub['현상'].fillna('').str.strip()
+                fk = fk[(sub['고장부위'].notna() & (sub['고장부위'].str.strip()!='')) |
+                        (sub['현상'].notna() & (sub['현상'].str.strip()!=''))]
+                fk = fk.str.strip(' /').str.strip()
+            else:
+                fk = sub[cols[0]].dropna()
+                fk = fk[fk.str.strip() != '']
+            if fk.empty: return '-'
+            top = fk.value_counts().head(3)
+            return '<br>'.join([f'  {i+1}. {str(k)[:30]} ({v}건)' for i,(k,v) in enumerate(top.items())]) or '-'
+
+        def _te_rr(key, src_df):
+            sub = src_df[src_df['설비_KEY'] == key] if '설비_KEY' in src_df.columns else src_df.iloc[0:0]
+            if '조치자' not in sub.columns: return '-'
+            col = sub['조치자'].dropna()
+            col = col[col.astype(str).str.strip() != '']
+            if col.empty: return '-'
+            top = col.value_counts().head(3)
+            return '<br>'.join([f'  {i+1}. {str(k)} ({v}건)' for i,(k,v) in enumerate(top.items())]) or '-'
+
+        top_recur = top_recur.copy()
+        top_recur['_tf'] = top_recur['설비_KEY'].apply(lambda k: _tf_rr(k, rdf))
+        top_recur['_te'] = top_recur['설비_KEY'].apply(lambda k: _te_rr(k, rdf))
         fig_rr = px.bar(top_recur.sort_values('재발률(%)'),
                         x='재발률(%)',y='설비_KEY',orientation='h',color='등급',
                         color_discrete_map=color_map_r,
-                        custom_data=['전체건수','재발건수','설비유형'])
+                        custom_data=['전체건수','재발건수','설비유형','_tf','_te'])
         fig_rr.update_traces(
-            hovertemplate='<b>%{y}</b><br>재발률: %{x:.1f}%<br>전체: %{customdata[0]}건 / 재발: %{customdata[1]}건<extra></extra>')
+            hovertemplate='<b>%{y}</b><br>재발률: %{x:.1f}%<br>전체: %{customdata[0]}건 / 재발: %{customdata[1]}건<br>'
+            '<b>▶ 반복 고장 Top 3 (부위/현상)</b><br>%{customdata[3]}<br>'
+            '<b>▶ 주요 조치자 Top 3</b><br>%{customdata[4]}'
+            '<extra></extra>')
         fig_rr.add_vline(x=30,line_dash='dash',line_color='#e67e22',annotation_text='경고 30%')
         fig_rr.update_layout(height=max(400,len(top_recur)*26),margin=dict(t=50,b=20),yaxis_title='',
                              legend=dict(orientation='h',y=1.0,x=0,yanchor='bottom',xanchor='left'))
@@ -2621,6 +2848,11 @@ with tab11:
                 '총정지시간': round(grp['소요시간'].sum(),0) if grp['소요시간'].notna().any() else 0,
                 '설비유형': grp['설비유형'].mode()[0] if not grp['설비유형'].isna().all() else '',
                 '최근발생': grp['발생일시'].max().strftime('%Y-%m-%d'),
+                '주요현상': (
+                    grp['현상'].dropna().astype(str)
+                    .pipe(lambda s: s[s.str.strip()!=''].value_counts().index[0]
+                          if (s.str.strip()!='').any() else '-')
+                    if '현상' in grp.columns else '-'),
             })
         if gap_rows:
             gap_df = pd.DataFrame(gap_rows).sort_values('평균재발간격_일')
@@ -2633,7 +2865,7 @@ with tab11:
                 st.markdown("**🔴 평균 재발간격 2주 이내 — 즉시 근본원인 분석 필요**")
                 for _,row in danger.iterrows():
                     st.markdown(f'<div class="card-red">'
-                                f'<b>{row["설비_KEY"]}</b> | 부위: <b>{row["고장부위"] or "미상"}</b>'
+                                f'<b>{row["설비_KEY"]}</b> | 부위: <b>{row["고장부위"] or "미상"}</b>' f' | 현상: <b>{str(row.get("주요현상","-")) or "-"}</b>'
                                 f' <span style="color:#888;font-size:12px">({row["설비유형"]})</span><br>'
                                 f'재발 <b>{row["재발횟수"]}회</b> / 평균간격 <b>{row["평균재발간격_일"]}일</b>'
                                 f' / 최단 <b>{row["최단재발간격_일"]}일</b>'
@@ -2700,12 +2932,31 @@ with tab12:
             with sc1:
                 st.markdown("##### 고장계통코드 Pareto")
                 if '고장계통코드' in sdf.columns:
+                    def _te_sys(code, src):
+                        sub = src[src['고장계통코드']==code]
+                        col = '설비_KEY' if '설비_KEY' in sub.columns else ('고장설비' if '고장설비' in sub.columns else None)
+                        if col is None: return '-'
+                        c = sub[col].dropna(); c = c[c.astype(str).str.strip()!='']
+                        if c.empty: return '-'
+                        top = c.value_counts().head(3)
+                        return '<br>'.join([f'  {i+1}. {k} ({v}건)' for i,(k,v) in enumerate(top.items())]) or '-'
+                    def _tf_sys(code, src):
+                        sub = src[src['고장계통코드']==code]
+                        if '현상' not in sub.columns: return '-'
+                        c = sub['현상'].dropna(); c = c[c.str.strip()!='']
+                        if c.empty: return '-'
+                        top = c.value_counts().head(3)
+                        return '<br>'.join([f'  {i+1}. {str(k)[:30]} ({v}건)' for i,(k,v) in enumerate(top.items())]) or '-'
                     sys_grp = sdf['고장계통코드'].value_counts().reset_index()
                     sys_grp.columns = ['계통','건수']
                     sys_grp['누적%'] = (sys_grp['건수'].cumsum()/sys_grp['건수'].sum()*100).round(1)
+                    sys_grp['_te'] = sys_grp['계통'].apply(lambda c: _te_sys(c, sdf))
+                    sys_grp['_tf'] = sys_grp['계통'].apply(lambda c: _tf_sys(c, sdf))
                     fig_sys = make_subplots(specs=[[{"secondary_y":True}]])
                     fig_sys.add_trace(go.Bar(x=sys_grp['계통'],y=sys_grp['건수'],
-                                             marker_color='#1e3a5f',name='건수'),secondary_y=False)
+                                             marker_color='#1e3a5f',name='건수',
+                                             customdata=np.stack([sys_grp['누적%'],sys_grp['_tf'],sys_grp['_te']],axis=-1),
+                                             hovertemplate='<b>%{x}</b><br>건수: %{y}건<br>누적: %{customdata[0]:.1f}%<br><b>▶ 반복 고장 Top 3</b><br>%{customdata[1]}<br><b>▶ 고장 다발 설비 Top 3</b><br>%{customdata[2]}<extra></extra>'),secondary_y=False)
                     fig_sys.add_trace(go.Scatter(x=sys_grp['계통'],y=sys_grp['누적%'],
                                                   mode='lines+markers',line=dict(color='#e74c3c',width=2),
                                                   name='누적%'),secondary_y=True)
@@ -2718,12 +2969,23 @@ with tab12:
             with sc2:
                 st.markdown("##### 원인코드 Pareto")
                 if '원인코드' in sdf.columns:
+                    def _te_ca(code, src):
+                        sub = src[src['원인코드']==code]
+                        col = '설비_KEY' if '설비_KEY' in sub.columns else ('고장설비' if '고장설비' in sub.columns else None)
+                        if col is None: return '-'
+                        c = sub[col].dropna(); c = c[c.astype(str).str.strip()!='']
+                        if c.empty: return '-'
+                        top = c.value_counts().head(3)
+                        return '<br>'.join([f'  {i+1}. {k} ({v}건)' for i,(k,v) in enumerate(top.items())]) or '-'
                     ca_grp = sdf['원인코드'].value_counts().reset_index()
                     ca_grp.columns = ['원인','건수']
                     ca_grp['누적%'] = (ca_grp['건수'].cumsum()/ca_grp['건수'].sum()*100).round(1)
+                    ca_grp['_te'] = ca_grp['원인'].apply(lambda c: _te_ca(c, sdf))
                     fig_ca = make_subplots(specs=[[{"secondary_y":True}]])
                     fig_ca.add_trace(go.Bar(x=ca_grp['원인'],y=ca_grp['건수'],
-                                            marker_color='#8e44ad',name='건수'),secondary_y=False)
+                                            marker_color='#8e44ad',name='건수',
+                                            customdata=np.stack([ca_grp['누적%'],ca_grp['_te']],axis=-1),
+                                            hovertemplate='<b>%{x}</b><br>건수: %{y}건<br>누적: %{customdata[0]:.1f}%<br><b>▶ 고장 다발 설비 Top 3</b><br>%{customdata[1]}<extra></extra>'),secondary_y=False)
                     fig_ca.add_trace(go.Scatter(x=ca_grp['원인'],y=ca_grp['누적%'],
                                                  mode='lines+markers',line=dict(color='#e74c3c',width=2),
                                                  name='누적%'),secondary_y=True)
@@ -2736,12 +2998,23 @@ with tab12:
             with sc3:
                 st.markdown("##### 조치코드 Pareto")
                 if '조치코드' in sdf.columns:
+                    def _te_ac(code, src):
+                        sub = src[src['조치코드']==code]
+                        col = '설비_KEY' if '설비_KEY' in sub.columns else ('고장설비' if '고장설비' in sub.columns else None)
+                        if col is None: return '-'
+                        c = sub[col].dropna(); c = c[c.astype(str).str.strip()!='']
+                        if c.empty: return '-'
+                        top = c.value_counts().head(3)
+                        return '<br>'.join([f'  {i+1}. {k} ({v}건)' for i,(k,v) in enumerate(top.items())]) or '-'
                     ac_grp = sdf['조치코드'].value_counts().reset_index()
                     ac_grp.columns = ['조치','건수']
                     ac_grp['누적%'] = (ac_grp['건수'].cumsum()/ac_grp['건수'].sum()*100).round(1)
+                    ac_grp['_te'] = ac_grp['조치'].apply(lambda c: _te_ac(c, sdf))
                     fig_ac = make_subplots(specs=[[{"secondary_y":True}]])
                     fig_ac.add_trace(go.Bar(x=ac_grp['조치'],y=ac_grp['건수'],
-                                            marker_color='#27ae60',name='건수'),secondary_y=False)
+                                            marker_color='#27ae60',name='건수',
+                                            customdata=np.stack([ac_grp['누적%'],ac_grp['_te']],axis=-1),
+                                            hovertemplate='<b>%{x}</b><br>건수: %{y}건<br>누적: %{customdata[0]:.1f}%<br><b>▶ 고장 다발 설비 Top 3</b><br>%{customdata[1]}<extra></extra>'),secondary_y=False)
                     fig_ac.add_trace(go.Scatter(x=ac_grp['조치'],y=ac_grp['누적%'],
                                                  mode='lines+markers',line=dict(color='#e74c3c',width=2),
                                                  name='누적%'),secondary_y=True)
@@ -3131,11 +3404,42 @@ with tab13:
         st.text_area("보고서 문구 (복사하여 사용)", value=report_text, height=420, key='rep_text')
 
         # 다운로드
-        col_dl1, col_dl2 = st.columns(2)
+
+        # ── HTML 인쇄용 다운로드 ─────────────────────────────
+        def _make_html_report(text, title):
+            import html as _ht
+            safe = _ht.escape(text)
+            return ('<!DOCTYPE html><html lang="ko"><head>'
+                    '<meta charset="UTF-8">'
+                    f'<title>{title}</title>'
+                    '<style>'
+                    'body{font-family:"Malgun Gothic","맑은 고딕",sans-serif;'
+                    '     margin:0;padding:20mm 20mm 20mm 25mm;'
+                    '     line-height:2.2;font-size:11pt;color:#222;}'
+                    'h1{font-size:15pt;color:#1e3a5f;'
+                    '   border-bottom:2px solid #1e3a5f;padding-bottom:8px;margin-bottom:20px;}'
+                    'pre{white-space:pre-wrap;word-wrap:break-word;font-family:inherit;font-size:10.5pt;}'
+                    '@page{size:A4;margin:18mm;}'
+                    '@media print{body{padding:0;}}'
+                    '</style></head><body>'
+                    f'<h1>⚙ {title}</h1><pre>{safe}</pre>'
+                    '</body></html>')
+
+        html_report = _make_html_report(report_text, f'보전팀 {label_cur} 고장분석 보고서')
+        col_dl1, col_dl2, col_dl3 = st.columns(3)
         with col_dl1:
             st.download_button("📋 TXT 다운로드", data=report_text.encode('utf-8-sig'),
                                file_name=f"{label_cur.replace(' ','_')}.txt",
                                mime='text/plain', use_container_width=True)
+
+        with col_dl3:
+            st.download_button(
+                '🖨 HTML 인쇄용 다운로드',
+                data=html_report.encode('utf-8'),
+                file_name=f"{label_cur.replace(' ','_')}_보고서.html",
+                mime='text/html',
+                use_container_width=True,
+                help='다운로드 후 브라우저에서 열어 Ctrl+P → PDF 저장 (잘림 없음)')
         with col_dl2:
             # Excel 요약표
             if not cur_df.empty:
@@ -3231,6 +3535,45 @@ with tab14:
             '3단계: 프린터 선택 → <b>PDF로 저장</b><br>'
             '4단계: 용지 → <b>A3 가로</b> 권장 / 배율 → <b>맞춤</b><br>'
             '5단계: <b>저장</b> 클릭</div>', unsafe_allow_html=True)
+
+        st.divider()
+        st.markdown('#### 📄 HTML 보고서 직접 다운로드 (PDF 잘림 없음)')
+        st.caption('다운로드된 HTML 파일을 브라우저에서 열고 Ctrl+P → PDF 저장하면 잘림 없이 인쇄됩니다.')
+        if st.button('HTML 보고서 생성', key='html_rpt_btn', use_container_width=True):
+            def _make_full_html(src_df):
+                import html as _ht
+                sections = []
+                if '설비유형' in src_df.columns:
+                    top_eq = src_df['설비유형'].value_counts().head(10)
+                    rows_eq = ''.join(f'<tr><td>{k}</td><td>{v}건</td></tr>' for k,v in top_eq.items())
+                    sections.append(f'<h2>설비유형별 고장건수</h2><table class="t"><tr><th>설비유형</th><th>건수</th></tr>{rows_eq}</table>')
+                if '라인_차종' in src_df.columns:
+                    top_ln = src_df['라인_차종'].value_counts().head(15)
+                    rows_ln = ''.join(f'<tr><td>{k}</td><td>{v}건</td></tr>' for k,v in top_ln.items())
+                    sections.append(f'<h2>라인별 고장건수 Top 15</h2><table class="t"><tr><th>라인</th><th>건수</th></tr>{rows_ln}</table>')
+                body = ''.join(sections)
+                return ('<!DOCTYPE html><html lang="ko"><head>'
+                        '<meta charset="UTF-8"><title>보전팀 분석 보고서</title>'
+                        '<style>'
+                        'body{font-family:"Malgun Gothic",sans-serif;margin:0;padding:20mm;font-size:10pt;line-height:1.8;}'
+                        'h1{font-size:16pt;color:#1e3a5f;border-bottom:2px solid #1e3a5f;padding-bottom:6px;}'
+                        'h2{font-size:12pt;color:#1e3a5f;margin-top:16px;page-break-after:avoid;}'
+                        '.t{border-collapse:collapse;width:100%;margin-bottom:16px;page-break-inside:avoid;}'
+                        '.t th{background:#1e3a5f;color:#fff;padding:6px 10px;text-align:left;font-size:9pt;}'
+                        '.t td{border:1px solid #ddd;padding:5px 10px;font-size:9pt;}'
+                        '.t tr:nth-child(even){background:#f5f8ff;}'
+                        '@page{size:A4;margin:15mm;}'
+                        '</style></head><body>'
+                        f'<h1>⚙ 보전팀 분析 보고서 — {datetime.now().strftime("%Y-%m-%d %H:%M")} 출력</h1>'
+                        f'{body}</body></html>')
+            html_full = _make_full_html(df)
+            st.download_button(
+                '⬇️ HTML 보고서 다운로드',
+                data=html_full.encode('utf-8'),
+                file_name=f"보전팀_분析보고서_{datetime.now().strftime('%Y%m%d_%H%M')}.html",
+                mime='text/html',
+                use_container_width=True,
+                key='html_full_dl')
 
 
 # ══════════════════════════════════════════════════════
