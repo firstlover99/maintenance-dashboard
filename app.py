@@ -1312,14 +1312,51 @@ with tab2:
                     .agg(건수=('소요시간','count'),총정지시간=('소요시간','sum'))
                     .reset_index().sort_values('건수',ascending=False).head(top_n))
         line_grp['평균MTTR'] = (line_grp['총정지시간']/line_grp['건수']).round(1)
-        fig_ln = px.bar(line_grp,x='건수',y='라인_차종',orientation='h',
-                        color='총정지시간',color_continuous_scale='Blues',
-                        custom_data=['총정지시간','평균MTTR'])
+
+        def _top_faults_str(라인명):
+            sub = fdf[fdf['라인_차종'] == 라인명]
+            if '고장부위' in sub.columns and '현상' in sub.columns:
+                fault_key = sub['고장부위'].fillna('') + ' / ' + sub['현상'].fillna('')
+            elif '고장부위' in sub.columns:
+                fault_key = sub['고장부위'].fillna('기타')
+            else:
+                fault_key = sub['현상'].fillna('기타')
+            top = fault_key.value_counts().head(3)
+            items = [f"  {i+1}. {str(k)[:30]} ({v}건)" for i, (k, v) in enumerate(top.items())]
+            return '<br>'.join(items) if items else '-'
+
+        def _top_equip_str(라인명):
+            sub = fdf[fdf['라인_차종'] == 라인명]
+            if '고장설비' not in sub.columns:
+                return '-'
+            top = sub['고장설비'].fillna('미상').value_counts().head(3)
+            return '<br>'.join(
+                [f"  {i+1}. {k} ({v}건)" for i, (k, v) in enumerate(top.items())]) or '-'
+
+        line_grp['_top_faults'] = line_grp['라인_차종'].apply(_top_faults_str)
+        line_grp['_top_equip']  = line_grp['라인_차종'].apply(_top_equip_str)
+        if '재발여부' in fdf.columns:
+            recur_map = fdf.groupby('라인_차종')['재발여부'].sum().astype(int)
+            line_grp['_recur'] = line_grp['라인_차종'].map(recur_map).fillna(0).astype(int)
+        else:
+            line_grp['_recur'] = 0
+
+        fig_ln = px.bar(line_grp, x='건수', y='라인_차종', orientation='h',
+                        color='총정지시간', color_continuous_scale='Blues',
+                        custom_data=['총정지시간', '평균MTTR', '_recur', '_top_equip', '_top_faults'])
         fig_ln.update_traces(
-            hovertemplate='<b>%{y}</b><br>건수: %{x}건<br>총정지: %{customdata[0]:,.0f}분<br>평균MTTR: %{customdata[1]:.1f}분<extra></extra>')
-        fig_ln.update_layout(height=max(300,len(line_grp)*26),
-                              margin=dict(t=10,b=20,l=10,r=60),yaxis_title='')
-        st.plotly_chart(fig_ln,use_container_width=True)
+            hovertemplate=(
+                '<b>%{y}</b><br>'
+                '건수: %{x}건 &nbsp;|&nbsp; 총정지: %{customdata[0]:,.0f}분 &nbsp;|&nbsp; 평균MTTR: %{customdata[1]:.1f}분<br>'
+                '재발: %{customdata[2]}건<br>'
+                '<b>▶ 반복 고장 Top 3 (부위/현상)</b><br>%{customdata[4]}<br>'
+                '<b>▶ 고장 다발 설비 Top 3</b><br>%{customdata[3]}'
+                '<extra></extra>'
+            )
+        )
+        fig_ln.update_layout(height=max(300, len(line_grp)*26),
+                              margin=dict(t=10, b=20, l=10, r=60), yaxis_title='')
+        st.plotly_chart(fig_ln, use_container_width=True)
 
         with st.expander("📋 고장현황 상세 데이터"):
             disp_cols = ['발생일시','라인','설비유형','고장설비','고장부위',
@@ -2884,63 +2921,212 @@ with tab13:
         st.markdown(f"##### 📄 {label_cur} 자동 생성 문구")
 
         report_lines = []
-        # 총괄
+
+        # ── 1. 총괄 ──────────────────────────────────────────
         report_lines.append(f"【총괄】")
         if prev_df.empty or pc == 0:
             report_lines.append(f"  - {label_cur} 기간 중 고장 발생 총 {cc}건, "
-                                 f"총 정지시간 {cs:.0f}분(약 {cs/60:.1f}시간).")
+                                 f"총 정지시간 {cs:.0f}분(약 {cs/60:.1f}시간), 평균 MTTR {cm:.0f}분.")
         else:
             chg_cnt  = (cc-pc)/pc*100
             chg_stop = (cs-ps)/ps*100 if ps>0 else 0
+            chg_mttr = (cm-pm_s)/pm_s*100 if pm_s>0 else 0
             dir_cnt  = "증가" if chg_cnt>0 else "감소"
             dir_stop = "증가" if chg_stop>0 else "감소"
-            report_lines.append(f"  - 고장건수 {cc}건 — 전기({label_prev}) 대비 "
+            dir_mttr = "악화" if chg_mttr>0 else "개선"
+            report_lines.append(f"  - 고장건수: {cc}건 — 전기({label_prev}) 대비 "
                                  f"{abs(chg_cnt):.0f}% {dir_cnt} ({pc}건 → {cc}건).")
-            report_lines.append(f"  - 총 정지시간 {cs:.0f}분 — 전기 대비 "
+            report_lines.append(f"  - 총 정지시간: {cs:.0f}분({cs/60:.1f}시간) — 전기 대비 "
                                  f"{abs(chg_stop):.0f}% {dir_stop} ({ps:.0f}분 → {cs:.0f}분).")
+            report_lines.append(f"  - 평균 MTTR: {cm:.0f}분 — 전기({pm_s:.0f}분) 대비 "
+                                 f"{abs(chg_mttr):.0f}% {dir_mttr}.")
 
-        # 설비유형별 현황
+        # ── 2. BM/PM 비율 ─────────────────────────────────────
+        if '보전구분' in cur_df.columns and not cur_df.empty:
+            bm_cnt = (cur_df['보전구분'] == 'BM(돌발)').sum()
+            pm_cnt = (cur_df['보전구분'] == 'PM(계획)').sum()
+            bm_pct = bm_cnt/cc*100 if cc else 0
+            pm_pct = pm_cnt/cc*100 if cc else 0
+            report_lines.append(f"\n【BM/PM 현황】")
+            report_lines.append(f"  - BM(돌발): {bm_cnt}건({bm_pct:.0f}%) / "
+                                 f"PM(계획): {pm_cnt}건({pm_pct:.0f}%)")
+            if bm_pct >= 80:
+                report_lines.append(f"  ⚠ BM 비율 {bm_pct:.0f}% — PM 전환 검토 필요")
+            if not prev_df.empty and '보전구분' in prev_df.columns and pc > 0:
+                prev_bm_pct = (prev_df['보전구분'] == 'BM(돌발)').sum() / pc * 100
+                diff_bm = bm_pct - prev_bm_pct
+                arrow = "▲" if diff_bm > 0 else "▼"
+                report_lines.append(f"  - 전기 BM 비율: {prev_bm_pct:.0f}% → 금기: {bm_pct:.0f}% "
+                                     f"({arrow} {abs(diff_bm):.0f}%p)")
+
+        # ── 3. 설비유형별 현황 ────────────────────────────────
         if not cur_df.empty and '설비유형' in cur_df.columns:
-            eq_rep = cur_df['설비유형'].value_counts().head(3)
+            eq_rep = cur_df['설비유형'].value_counts().head(5)
             report_lines.append(f"\n【설비유형별 고장 현황】")
             for eq, cnt_eq in eq_rep.items():
-                pct_eq = cnt_eq/cc*100
+                pct_eq  = cnt_eq/cc*100
                 stop_eq = cur_df[cur_df['설비유형']==eq]['소요시간'].sum()
-                report_lines.append(f"  - {eq}: {cnt_eq}건({pct_eq:.0f}%), 정지시간 {stop_eq:.0f}분")
+                mttr_eq = cur_df[cur_df['설비유형']==eq]['소요시간'].mean()
+                report_lines.append(
+                    f"  - {eq}: {cnt_eq}건({pct_eq:.0f}%), "
+                    f"정지시간 {stop_eq:.0f}분, 평균MTTR {mttr_eq:.0f}분")
 
-        # 재발 현황
+        # ── 4. 라인별 현황 Top 5 ─────────────────────────────
+        if not cur_df.empty and '라인_차종' in cur_df.columns:
+            line_rep = (cur_df.groupby('라인_차종')
+                        .agg(건수=('소요시간','count'), 정지=('소요시간','sum'))
+                        .sort_values('건수', ascending=False).head(5))
+            report_lines.append(f"\n【라인별 고장 현황 Top 5】")
+            for ln, row_ln in line_rep.iterrows():
+                report_lines.append(
+                    f"  - {ln}: {int(row_ln['건수'])}건, 정지 {row_ln['정지']:.0f}분")
+
+        # ── 5. 최장 정지 단건 Top 5 ──────────────────────────
+        if not cur_df.empty and '소요시간' in cur_df.columns:
+            _top_cols = [c for c in ['발생일시','설비_KEY','현상','소요시간','조치자']
+                         if c in cur_df.columns]
+            top_stop = cur_df[_top_cols].dropna(subset=['소요시간']).nlargest(5, '소요시간')
+            report_lines.append(f"\n【최장 정지 단건 Top 5】")
+            for _, rs in top_stop.iterrows():
+                dt_str  = rs['발생일시'].strftime('%m/%d %H:%M') if '발생일시' in rs.index and pd.notna(rs['발생일시']) else '-'
+                key_str = rs.get('설비_KEY', '-')
+                phenom  = str(rs.get('현상') or '-')[:25]
+                worker  = str(rs.get('조치자') or '-')
+                report_lines.append(
+                    f"  - [{dt_str}] {key_str} | {phenom} | "
+                    f"{rs['소요시간']:.0f}분 | 조치자: {worker}")
+
+        # ── 6. 고장 계통 분析 ─────────────────────────────────
+        if '고장계통코드' in cur_df.columns and not cur_df.empty:
+            sys_rep = cur_df['고장계통코드'].value_counts().head(5)
+            report_lines.append(f"\n【고장 계통 분析】")
+            for sys_cd, cnt_s in sys_rep.items():
+                stop_s = cur_df[cur_df['고장계통코드']==sys_cd]['소요시간'].sum()
+                report_lines.append(
+                    f"  - {sys_cd}: {cnt_s}건({cnt_s/cc*100:.0f}%), 정지 {stop_s:.0f}분")
+
+        # ── 7. 주요 원인 Top 3 ────────────────────────────────
+        if '원인코드' in cur_df.columns and not cur_df.empty:
+            cause_rep = cur_df['원인코드'].value_counts().head(3)
+            report_lines.append(f"\n【주요 고장 원인 Top 3】")
+            for cause, cnt_c in cause_rep.items():
+                report_lines.append(f"  - {cause}: {cnt_c}건({cnt_c/cc*100:.0f}%)")
+
+        # ── 8. 재발 고장 ──────────────────────────────────────
         if '재발여부' in cur_df.columns and cr > 0:
             r_pct = cr/cc*100 if cc else 0
             report_lines.append(f"\n【재발 고장】")
             report_lines.append(f"  - 재발 고장 {cr}건(재발률 {r_pct:.0f}%) 발생.")
-            # 재발 상위 설비
             if '설비_KEY' in cur_df.columns:
-                top_rec = (cur_df[cur_df['재발여부']==True]['설비_KEY']
-                           .value_counts().head(3))
-                for eq_k, cnt_k in top_rec.items():
-                    report_lines.append(f"  - {eq_k}: {cnt_k}건 재발")
+                top_rec = (cur_df[cur_df['재발여부']==True]
+                           .groupby('설비_KEY')
+                           .agg(재발건수=('재발여부','count'), 정지시간=('소요시간','sum'))
+                           .sort_values('재발건수', ascending=False).head(5))
+                for eq_k, row_r in top_rec.iterrows():
+                    report_lines.append(
+                        f"  - {eq_k}: {int(row_r['재발건수'])}건 재발, "
+                        f"정지 {row_r['정지시간']:.0f}분 → 근본원인 분析 필요")
 
-        # 고장계통 현황
-        if '고장계통코드' in cur_df.columns and not cur_df.empty:
-            sys_rep = cur_df['고장계통코드'].value_counts().head(3)
-            report_lines.append(f"\n【고장 계통 분석】")
-            for sys_cd, cnt_s in sys_rep.items():
-                report_lines.append(f"  - {sys_cd}: {cnt_s}건({cnt_s/cc*100:.0f}%)")
+        # ── 9. 야간 돌발 현황 ─────────────────────────────────
+        if '보전구분' in cur_df.columns and '발생일시' in cur_df.columns:
+            bm_d = cur_df[cur_df['보전구분']=='BM(돌발)']
+            if not bm_d.empty:
+                night_d = bm_d[bm_d['발생일시'].dt.hour.apply(lambda h: h>=22 or h<6)]
+                night_pct = len(night_d)/len(bm_d)*100
+                report_lines.append(f"\n【야간 돌발 현황】")
+                report_lines.append(
+                    f"  - 야간(22시~06시) 돌발 고장: {len(night_d)}건 "
+                    f"(BM 대비 {night_pct:.0f}%)")
+                if night_pct >= 25:
+                    report_lines.append(f"  ⚠ 야간 비율 높음 — 야간 단독 작업 위험도 점검 필요")
 
-        # MTTR 경고
+        # ── 10. 조치자별 출동 현황 ────────────────────────────
+        if '조치자' in cur_df.columns and not cur_df.empty:
+            from collections import Counter
+            all_workers_rep = []
+            for v in cur_df['조치자'].dropna():
+                all_workers_rep.extend(parse_workers(str(v)))
+            if all_workers_rep:
+                worker_cnt_rep = Counter(all_workers_rep)
+                top_workers_rep = worker_cnt_rep.most_common(5)
+                report_lines.append(f"\n【조치자 출동 현황 Top 5】")
+                for w_name, w_cnt in top_workers_rep:
+                    report_lines.append(f"  - {w_name}: {w_cnt}건")
+
+        # ── 11. 예비품 교체 현황 ──────────────────────────────
+        if '조치코드' in cur_df.columns and not cur_df.empty:
+            spare_cnt = (cur_df['조치코드'] == '교체').sum()
+            spare_pct  = spare_cnt/cc*100 if cc else 0
+            report_lines.append(f"\n【예비품 교체 현황】")
+            report_lines.append(
+                f"  - 부품 교체 {spare_cnt}건({spare_pct:.0f}%) — "
+                f"예비품 재고 현황 확인 필요")
+
+        # ── 12. MTTR 개선/악화 설비 알림 ─────────────────────
+        if (not cur_df.empty and not prev_df.empty
+                and '설비_KEY' in cur_df.columns
+                and '소요시간' in cur_df.columns):
+            cur_mttr_map  = cur_df.groupby('설비_KEY')['소요시간'].mean()
+            prev_mttr_map = (prev_df.groupby('설비_KEY')['소요시간'].mean()
+                             if '소요시간' in prev_df.columns else pd.Series(dtype=float))
+            common_keys   = cur_mttr_map.index.intersection(prev_mttr_map.index)
+            if len(common_keys) > 0:
+                delta_mttr = (cur_mttr_map[common_keys] - prev_mttr_map[common_keys]).sort_values(ascending=False)
+                worst3 = delta_mttr.head(3)
+                best3  = delta_mttr.tail(3)
+                if not worst3.empty and worst3.iloc[0] > 0:
+                    report_lines.append(f"\n【MTTR 악화 설비 (전기 대비)】")
+                    for eq_k, diff_v in worst3.items():
+                        if diff_v > 0:
+                            report_lines.append(
+                                f"  - {eq_k}: +{diff_v:.0f}분 악화 "
+                                f"({prev_mttr_map[eq_k]:.0f}분 → {cur_mttr_map[eq_k]:.0f}분)")
+                if not best3.empty and best3.iloc[-1] < 0:
+                    report_lines.append(f"\n【MTTR 개선 설비 (전기 대비)】")
+                    for eq_k, diff_v in best3.items():
+                        if diff_v < 0:
+                            report_lines.append(
+                                f"  - {eq_k}: {diff_v:.0f}분 개선 "
+                                f"({prev_mttr_map[eq_k]:.0f}분 → {cur_mttr_map[eq_k]:.0f}분)")
+
+        # ── 13. 계획정비 전환 대상 ────────────────────────────
+        if '계획정비전환대상' in cur_df.columns and not cur_df.empty:
+            _pm_tgt = (cur_df[cur_df['계획정비전환대상']=='Y']['설비_KEY'].unique()
+                       if '설비_KEY' in cur_df.columns else [])
+            if len(_pm_tgt) > 0:
+                report_lines.append(f"\n【계획정비 전환 대상】")
+                report_lines.append(
+                    f"  - 해당 설비 {len(_pm_tgt)}개 — 재발 3회 이상 또는 MTTR 60분 이상")
+                for eq_k in _pm_tgt[:5]:
+                    report_lines.append(f"  · {eq_k}")
+                if len(_pm_tgt) > 5:
+                    report_lines.append(f"  · 외 {len(_pm_tgt)-5}개")
+
+        # ── 14. MTTR 경고 ─────────────────────────────────────
         if cm >= st.session_state.kpi_target_mttr:
             report_lines.append(f"\n【MTTR 경고】")
-            report_lines.append(f"  - 평균 MTTR {cm:.0f}분 — 목표 {st.session_state.kpi_target_mttr}분 초과.")
-            report_lines.append(f"  - 수리 장기화 설비 예비품 확보 및 매뉴얼 점검 필요.")
+            report_lines.append(
+                f"  - 평균 MTTR {cm:.0f}분 — 목표 "
+                f"{st.session_state.kpi_target_mttr}분 초과.")
+            report_lines.append(
+                f"  - 수리 장기화 설비 예비품 확보 및 수리 매뉴얼 점검 필요.")
 
-        # 조치사항
+        # ── 15. 차기 조치 사항 ────────────────────────────────
         report_lines.append(f"\n【차기 조치 사항】")
         if cc > pc:
-            report_lines.append(f"  - 고장건수 증가 추세 — 예방보전 점검주기 검토 필요.")
+            report_lines.append(
+                f"  ① 고장건수 증가 추세({pc}건→{cc}건) — "
+                f"예방보전 점검주기 단축 검토 필요.")
         if cr >= 3:
-            report_lines.append(f"  - 재발 고장 {cr}건 — 근본원인 분석 및 恒久대책 수립.")
+            report_lines.append(
+                f"  ② 재발 고장 {cr}건 — 근본원인 분析 및 恒久대책 수립.")
+        if '보전구분' in cur_df.columns:
+            _bm_pct_final = (cur_df['보전구분']=='BM(돌발)').mean()*100
+            if _bm_pct_final >= 80:
+                report_lines.append(
+                    f"  ③ BM 비율 {_bm_pct_final:.0f}% — 계획정비 전환 대상 선정 추진.")
         report_lines.append(f"  - 위험도 상위 설비 집중 관리 지속.")
-
+        report_lines.append(f"  - 예비품 재고 현황 점검 및 긴급 발주 대상 확인.")
         report_text = "\n".join(report_lines)
         st.text_area("보고서 문구 (복사하여 사용)", value=report_text, height=420, key='rep_text')
 
