@@ -11,6 +11,20 @@ from datetime import datetime, timedelta
 import warnings
 warnings.filterwarnings('ignore')
 
+import streamlit.components.v1 as _st_comp
+
+def _print_tab(label='이 탭'):
+    """각 탭 상단에 삽입 — 클릭 시 현재 탭 내용을 PDF/인쇄로 저장"""
+    _st_comp.html(
+        f'<div class="no-print" style="text-align:right;margin:0 0 4px 0;">'
+        f'<button onclick="window.parent.print()" '
+        f'style="background:#1e3a5f;color:#fff;border:none;border-radius:6px;'
+        f'padding:6px 16px;font-size:12px;cursor:pointer;'
+        f'font-family:inherit;letter-spacing:.3px;">'
+        f'🖨&nbsp; {label} PDF 저장</button></div>',
+        height=42)
+
+
 st.set_page_config(
     page_title="보전팀 통합 분석 시스템",
     page_icon="🔧",
@@ -43,28 +57,41 @@ st.markdown("""
     .code-badge {display:inline-block; background:#e8f4fd; color:#1a5276;
                  border-radius:4px; padding:2px 7px; font-size:11px;
                  font-weight:600; margin:2px;}
-    /* ── 예방정비 호버 툴팁 ─────────────────────── */
+    /* ── 예방정비 호버 툴팁 (오른쪽 표시) ──────── */
     .pm-card { position:relative; cursor:default; }
     .pm-tooltip {
         display:none; position:absolute; z-index:9999;
         background:#fff; border:1px solid #d0d0d0;
         border-radius:8px; padding:12px 16px;
-        min-width:340px; max-width:480px;
-        left:0; top:105%;
-        box-shadow:0 6px 20px rgba(0,0,0,.15);
+        min-width:280px; max-width:420px;
+        left:0; top:100%;
+        box-shadow:0 6px 20px rgba(0,0,0,.18);
         font-size:12px; line-height:2.0;
         pointer-events:none;
+        white-space:normal;
     }
     .pm-card:hover .pm-tooltip { display:block; }
-    /* ── 인쇄/PDF 잘림 방지 ─────────────────────── */
+    /* ── 인쇄/PDF : 현재 탭만 출력 ─────────────── */
     @media print {
-        section[data-testid="stSidebar"] { display:none !important; }
-        .block-container { padding:0 !important; max-width:100% !important; }
-        .stApp, .main, [data-testid="stAppViewContainer"]
-            { overflow:visible !important; height:auto !important; }
-        .card-red,.card-org,.card-grn { page-break-inside:avoid; }
-        .stPlotlyChart { page-break-inside:avoid; }
-        @page { size:A4; margin:15mm; }
+        header, footer, .stDeployButton,
+        section[data-testid="stSidebar"],
+        [data-baseweb="tab-list"],
+        .pm-tooltip { display:none !important; }
+        /* 비활성 탭 패널 숨김 */
+        [role="tabpanel"][aria-hidden="true"] { display:none !important; }
+        /* 활성 탭 패널 overflow 해제 */
+        [role="tabpanel"]:not([aria-hidden="true"]) {
+            overflow:visible !important; height:auto !important;
+        }
+        .stApp, .main, .block-container,
+        [data-testid="stAppViewContainer"]
+            { overflow:visible !important; height:auto !important;
+              padding:0 !important; max-width:100% !important; }
+        .card-red,.card-org,.card-grn,.stPlotlyChart
+            { page-break-inside:avoid; }
+        /* 인쇄 버튼 숨김 */
+        .no-print { display:none !important; }
+        @page { size:A4 landscape; margin:10mm; }
     }
 </style>
 """, unsafe_allow_html=True)
@@ -1251,6 +1278,7 @@ with tab2:
     if df is None:
         st.info("Tab1에서 데이터를 불러오고 '통합 실행'을 눌러주세요.")
     else:
+        _print_tab('고장현황 분析')
         st.subheader("고장현황 분석")
         fc1,fc2,fc3,fc4,fc5 = st.columns([2,2,2,2,1])
         with fc1:
@@ -1295,9 +1323,9 @@ with tab2:
             cols = [c for c in ['고장부위','현상'] if c in sub.columns]
             if not cols: return '-'
             if len(cols) == 2:
-                fk = sub['고장부위'].fillna('').str.strip() + ' / ' + sub['현상'].fillna('').str.strip()
-                fk = fk[(sub['고장부위'].notna() & (sub['고장부위'].str.strip()!='')) |
-                        (sub['현상'].notna() & (sub['현상'].str.strip()!=''))]
+                fk = sub['고장부위'].astype(str).replace('nan','').str.strip() + ' / ' + sub['현상'].astype(str).replace('nan','').str.strip()
+                fk = fk[(sub['고장부위'].astype(str).replace('nan','').str.strip()!='') |
+                        (sub['현상'].astype(str).replace('nan','').str.strip()!='')]
                 fk = fk.str.strip(' /').str.strip()
             else:
                 fk = sub[cols[0]].dropna()
@@ -1369,7 +1397,7 @@ with tab2:
         def _top_faults_str(라인명):
             sub = fdf[fdf['라인_차종'] == 라인명]
             if '고장부위' in sub.columns and '현상' in sub.columns:
-                fault_key = sub['고장부위'].fillna('') + ' / ' + sub['현상'].fillna('')
+                fault_key = sub['고장부위'].astype(str).replace('nan','').str.strip() + ' / ' + sub['현상'].astype(str).replace('nan','').str.strip()
             elif '고장부위' in sub.columns:
                 fault_key = sub['고장부위'].fillna('기타')
             else:
@@ -1426,6 +1454,7 @@ with tab3:
     if df is None:
         st.info("Tab1에서 데이터를 불러오고 '통합 실행'을 눌러주세요.")
     else:
+        _print_tab('MTTR/MTBF 分析')
         st.subheader("설비 MTTR / MTBF 분석")
         st.caption("⚠️ MTBF는 근사값입니다 — 월~토 일15시간 가동 적용")
 
@@ -1478,7 +1507,7 @@ with tab3:
                     cols = [c for c in ['고장부위','현상'] if c in sub.columns]
                     if not cols: return '-'
                     if len(cols) == 2:
-                        fk = sub['고장부위'].fillna('').str.strip() + ' / ' + sub['현상'].fillna('').str.strip()
+                        fk = sub['고장부위'].astype(str).replace('nan','').str.strip() + ' / ' + sub['현상'].astype(str).replace('nan','').str.strip()
                         fk = fk[(sub['고장부위'].notna() & (sub['고장부위'].str.strip()!='')) |
                                 (sub['현상'].notna() & (sub['현상'].str.strip()!=''))]
                         fk = fk.str.strip(' /').str.strip()
@@ -1673,6 +1702,7 @@ with tab4:
     if df is None:
         st.info("Tab1에서 데이터를 불러오고 '통합 실행'을 눌러주세요.")
     else:
+        _print_tab('인원 부하 分析')
         st.subheader("인원 업무부하 분석")
         wdf_base = apply_global_filter(df)
         worker_df = get_worker_df(wdf_base)
@@ -1723,7 +1753,7 @@ with tab4:
                 cols = [c for c in ['고장부위','현상'] if c in sub.columns]
                 if not cols: return '-'
                 if len(cols) == 2:
-                    fk = sub['고장부위'].fillna('').str.strip() + ' / ' + sub['현상'].fillna('').str.strip()
+                    fk = sub['고장부위'].astype(str).replace('nan','').str.strip() + ' / ' + sub['현상'].astype(str).replace('nan','').str.strip()
                     fk = fk[(sub['고장부위'].notna() & (sub['고장부위'].str.strip()!='')) |
                             (sub['현상'].notna() & (sub['현상'].str.strip()!=''))]
                     fk = fk.str.strip(' /').str.strip()
@@ -2046,6 +2076,7 @@ with tab5:
     if df is None:
         st.info("Tab1에서 데이터를 불러오고 '통합 실행'을 눌러주세요.")
     else:
+        _print_tab('설비 위험도')
         st.markdown("## 🏆 설비 위험도 Ranking")
         st.caption("위험도 = 고장빈도 × 가중치 + 총정지시간 × 가중치 + 평균MTTR × 가중치")
         rf1,rf2,rf3 = st.columns([3,3,2])
@@ -2092,9 +2123,9 @@ with tab5:
             cols = [c for c in ['고장부위','현상'] if c in sub.columns]
             if not cols: return '-'
             if len(cols) == 2:
-                fk = sub['고장부위'].fillna('').str.strip() + ' / ' + sub['현상'].fillna('').str.strip()
-                fk = fk[(sub['고장부위'].notna() & (sub['고장부위'].str.strip()!='')) |
-                        (sub['현상'].notna() & (sub['현상'].str.strip()!=''))]
+                fk = sub['고장부위'].astype(str).replace('nan','').str.strip() + ' / ' + sub['현상'].astype(str).replace('nan','').str.strip()
+                fk = fk[(sub['고장부위'].astype(str).replace('nan','').str.strip()!='') |
+                        (sub['현상'].astype(str).replace('nan','').str.strip()!='')]
                 fk = fk.str.strip(' /').str.strip()
             else:
                 fk = sub[cols[0]].dropna()
@@ -2195,6 +2226,7 @@ with tab7:
     if df is None:
         st.info("Tab1에서 데이터를 불러오고 '통합 실행'을 눌러주세요.")
     else:
+        _print_tab('예방정비 추천')
         st.markdown("## 🔧 예방정비 추천")
         pf1,pf2,pf3 = st.columns([2,2,1])
         with pf2:
@@ -2303,6 +2335,7 @@ with tab8:
     if df is None:
         st.info("Tab1에서 데이터를 불러오고 '통합 실행'을 눌러주세요.")
     else:
+        _print_tab('월별 트렌드')
         st.markdown("## 📈 월별 고장 트렌드")
         tf1,tf2 = st.columns([3,1])
         with tf2:
@@ -2732,6 +2765,7 @@ with tab11:
     if df is None:
         st.info("Tab1에서 데이터를 불러오고 '통합 실행'을 눌러주세요.")
     else:
+        _print_tab('재발 고장 分析')
         st.markdown("## 🔁 재발 고장 전용 분석")
         st.caption("수리 완료가 아니라 **재발 억제** 관점에서 관리합니다")
 
@@ -2789,9 +2823,9 @@ with tab11:
             cols = [c for c in ['고장부위','현상'] if c in sub.columns]
             if not cols: return '-'
             if len(cols) == 2:
-                fk = sub['고장부위'].fillna('').str.strip() + ' / ' + sub['현상'].fillna('').str.strip()
-                fk = fk[(sub['고장부위'].notna() & (sub['고장부위'].str.strip()!='')) |
-                        (sub['현상'].notna() & (sub['현상'].str.strip()!=''))]
+                fk = sub['고장부위'].astype(str).replace('nan','').str.strip() + ' / ' + sub['현상'].astype(str).replace('nan','').str.strip()
+                fk = fk[(sub['고장부위'].astype(str).replace('nan','').str.strip()!='') |
+                        (sub['현상'].astype(str).replace('nan','').str.strip()!='')]
                 fk = fk.str.strip(' /').str.strip()
             else:
                 fk = sub[cols[0]].dropna()
@@ -2910,6 +2944,7 @@ with tab12:
     if df is None:
         st.info("Tab1에서 데이터를 불러오고 '통합 실행'을 눌러주세요.")
     else:
+        _print_tab('표준코드 分析')
         st.markdown("## 🏷️ 표준코드 분석")
         st.caption("고장계통코드 · 원인코드 · 조치코드 기반 정밀 Pareto 분석")
 
@@ -3122,6 +3157,7 @@ with tab13:
     if df is None:
         st.info("Tab1에서 데이터를 불러오고 '통합 실행'을 눌러주세요.")
     else:
+        _print_tab('월보/주보')
         st.markdown("## 📝 월보 · 주보 자동 작성")
         st.caption("기간을 선택하면 보고서용 요약 문구를 자동 생성합니다")
 
@@ -3464,6 +3500,7 @@ with tab14:
     if df is None:
         st.info("Tab1에서 데이터를 불러오고 '통합 실행'을 눌러주세요.")
     else:
+        _print_tab('분析 결과 출력')
         st.subheader("분석 결과 출력")
         oc1,oc2 = st.columns(2)
         with oc1:
