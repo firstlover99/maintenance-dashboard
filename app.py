@@ -162,7 +162,7 @@ ACTION_CODE_MAP = {
     '티칭': ['티칭','teaching','원점','원위치','좌표'],
     '청소': ['청소','세척','cleaning','clean','제거','blow','에어블로'],
     '리셋': ['리셋','reset','재기동','재가동','원복','복구','재설정'],
-    '개선': ['개선','방지','대책','영구','恒久','항구','modification'],
+    '개선': ['개선','방지','대책','영구','항구','modification'],
     '예방': ['예방','pm','p/m','계획','정기'],
 }
 
@@ -589,6 +589,60 @@ def load_robot(file_obj):
     df['설비_KEY'] = df['라인_차종'] + ' | ' + df['고장설비'].astype(str).str.strip()
     return _enrich_codes(df)
 
+def load_gwangju_original(file_obj):
+    """원본 14컬럼 광주공장 고장이력 직접 읽기 (변환 없이)"""
+    file_obj.seek(0)
+    df = pd.read_excel(file_obj, sheet_name='Sheet1', header=0)
+    df.columns = ['구분','라인명','정지시각','출동시각_raw','완료시각','소요시각',
+                  '설비유형','고장설비','고장부위','현상','원인','조치','비고','조치자']
+    for col in ['정지시각','완료시각']:
+        df[col] = df[col].apply(parse_dt).apply(sanitize_dt)
+    def fix_출동(row):
+        dt = sanitize_dt(parse_dt(row['출동시각_raw']))
+        return dt if dt else row['정지시각']
+    df['출동시각'] = df.apply(fix_출동, axis=1)
+    df['발생일시'] = df['정지시각'].combine_first(df['출동시각']).combine_first(df['완료시각'])
+    df['발생일시'] = df['발생일시'].apply(sanitize_dt)
+    df['년'] = df['발생일시'].apply(lambda x: x.year if x else None)
+    df['월'] = df['발생일시'].apply(lambda x: x.month if x else None)
+    df['일'] = df['발생일시'].apply(lambda x: x.day if x else None)
+    df['주'] = df['발생일시'].apply(lambda x: x.isocalendar()[1] if x else None)
+    df.rename(columns={'소요시각': '소요시간'}, inplace=True)
+    def fix_dur(row):
+        v = to_float_safe(row['소요시간'])
+        if v: return v
+        if pd.notna(row['완료시각']) and pd.notna(row['출동시각']):
+            try:
+                d = (row['완료시각'] - row['출동시각']).total_seconds() / 60
+                return round(d, 1) if d > 0 else None
+            except: return None
+        return None
+    df['소요시간'] = df.apply(fix_dur, axis=1)
+    df['라인'] = df['라인명'].apply(
+        lambda v: str(v).strip() if pd.notna(v) and str(v).strip() not in ('','nan') else None)
+    df['차종'] = None
+    df['라인_KEY'] = df['라인']
+    df['고장부위_STD'] = df['고장부위']
+    df['NO'] = range(len(df))
+    def merge_bigo(row):
+        parts = [str(row['구분']).strip() if pd.notna(row['구분']) and str(row['구분']).strip() not in ('','nan') else '',
+                 str(row['비고']).strip()   if pd.notna(row['비고'])  and str(row['비고']).strip()  not in ('','nan') else '']
+        parts = [p for p in parts if p]
+        return ' / '.join(parts) if parts else None
+    df['비고'] = df.apply(merge_bigo, axis=1)
+    df['조치내역'] = df['조치']
+    for col in ['라인','설비유형','고장설비','고장부위','현상','원인','조치내역','조치자','비고']:
+        df[col] = df[col].apply(
+            lambda v: None if (v is None or (isinstance(v,float) and pd.isna(v)))
+            else str(v).strip() if str(v).strip() not in ('nan','None','') else None)
+    df['설비유형'] = df['설비유형'].apply(norm_equip)
+    df['고장분류'] = df.apply(lambda r: classify_fault(r['현상'], r['원인']), axis=1)
+    df['조치유형'] = df['조치내역'].apply(classify_action)
+    df['파일출처'] = '로봇/지그'
+    df['라인_차종'] = df['라인'].fillna('미상').astype(str).str.strip()
+    df['설비_KEY'] = df['라인_차종'] + ' | ' + df['고장설비'].fillna('').astype(str).str.strip()
+    return _enrich_codes(df)
+
 def detect_and_load(file_obj, fname=''):
     try:
         xf = pd.ExcelFile(file_obj)
@@ -604,6 +658,8 @@ def detect_and_load(file_obj, fname=''):
             return load_robot(file_obj), 'robot'
         if all(c in cols for c in ['년','월','라인','설비유형']):
             return load_press(file_obj), 'press'
+        if any(c in cols for c in ['구분','라인명','소요시각']):
+            return load_gwangju_original(file_obj), 'robot'
         if len(cols) >= 20: return load_robot(file_obj), 'robot'
         if len(cols) >= 15: return load_press(file_obj), 'press'
         return None, f'인식불가 (시트: {target}, 컬럼수: {len(cols)})'
@@ -951,7 +1007,7 @@ def calc_mom_delta(df, year, month):
 # 헤더
 # ══════════════════════════════════════════════════════
 st.markdown('<div class="main-title">🔧 보전팀 통합 분석 시스템</div>', unsafe_allow_html=True)
-st.markdown('<div class="sub-title">호원오토 평택공장 | 보전관리 2팀 | 정한식 팀장</div>', unsafe_allow_html=True)
+st.markdown('<div class="sub-title">호원오토 평택공장 | 보전관리 2팀</div>', unsafe_allow_html=True)
 
 # ── 🚨 상단 경고 배너 (데이터 로드 후 자동 표시) ──────
 _mdf = st.session_state.merged_df
@@ -1290,7 +1346,7 @@ with tab2:
     if df is None:
         st.info("Tab1에서 데이터를 불러오고 '통합 실행'을 눌러주세요.")
     else:
-        _print_tab('고장현황 분析')
+        _print_tab('고장현황 분석')
         st.subheader("고장현황 분석")
         fc1,fc2,fc3,fc4,fc5 = st.columns([2,2,2,2,1])
         with fc1:
@@ -1466,7 +1522,7 @@ with tab3:
     if df is None:
         st.info("Tab1에서 데이터를 불러오고 '통합 실행'을 눌러주세요.")
     else:
-        _print_tab('MTTR/MTBF 分析')
+        _print_tab('MTTR/MTBF 분석')
         st.subheader("설비 MTTR / MTBF 분석")
         st.caption("⚠️ MTBF는 근사값입니다 — 월~토 일15시간 가동 적용")
 
@@ -1714,7 +1770,7 @@ with tab4:
     if df is None:
         st.info("Tab1에서 데이터를 불러오고 '통합 실행'을 눌러주세요.")
     else:
-        _print_tab('인원 부하 分析')
+        _print_tab('인원 부하 분석')
         st.subheader("인원 업무부하 분석")
         wdf_base = apply_global_filter(df)
         worker_df = get_worker_df(wdf_base)
@@ -2671,7 +2727,7 @@ with tab9:
             if r_pct >= 25:
                 comment_lines.append(
                     f"🔁 {period_label} 재발 고장 비율 {r_pct:.0f}% — "
-                    f"재발 억제 대책 수립 필요 (恒久대책 미수립 의심)")
+                    f"재발 억제 대책 수립 필요 (근본대책 미수립 의심)")
         # 전기계 비교
         if prev_cnt > 0:
             chg = (cur_cnt - prev_cnt) / prev_cnt * 100
@@ -2777,7 +2833,7 @@ with tab11:
     if df is None:
         st.info("Tab1에서 데이터를 불러오고 '통합 실행'을 눌러주세요.")
     else:
-        _print_tab('재발 고장 分析')
+        _print_tab('재발 고장 분석')
         st.markdown("## 🔁 재발 고장 전용 분석")
         st.caption("수리 완료가 아니라 **재발 억제** 관점에서 관리합니다")
 
@@ -2917,7 +2973,7 @@ with tab11:
                                 f' / 최단 <b>{row["최단재발간격_일"]}일</b>'
                                 f' / 총정지 <b>{row["총정지시간"]:.0f}분</b> / 최근: {row["최근발생"]}<br>'
                                 f'<span style="color:#c0392b;font-size:12px">'
-                                f'📌 恒久대책 수립 — 계획정비 전환 검토 필요</span>'
+                                f'📌 근본대책 수립 — 계획정비 전환 검토 필요</span>'
                                 f'</div>', unsafe_allow_html=True)
 
             with st.expander("📋 전체 재발 간격 분석 테이블"):
@@ -2956,7 +3012,7 @@ with tab12:
     if df is None:
         st.info("Tab1에서 데이터를 불러오고 '통합 실행'을 눌러주세요.")
     else:
-        _print_tab('표준코드 分析')
+        _print_tab('표준코드 분석')
         st.markdown("## 🏷️ 표준코드 분석")
         st.caption("고장계통코드 · 원인코드 · 조치코드 기반 정밀 Pareto 분석")
 
@@ -3317,10 +3373,10 @@ with tab13:
                     f"  - [{dt_str}] {key_str} | {phenom} | "
                     f"{rs['소요시간']:.0f}분 | 조치자: {worker}")
 
-        # ── 6. 고장 계통 분析 ─────────────────────────────────
+        # ── 6. 고장 계통 분석 ─────────────────────────────────
         if '고장계통코드' in cur_df.columns and not cur_df.empty:
             sys_rep = cur_df['고장계통코드'].value_counts().head(5)
-            report_lines.append(f"\n【고장 계통 분析】")
+            report_lines.append(f"\n【고장 계통 분석】")
             for sys_cd, cnt_s in sys_rep.items():
                 stop_s = cur_df[cur_df['고장계통코드']==sys_cd]['소요시간'].sum()
                 report_lines.append(
@@ -3346,7 +3402,7 @@ with tab13:
                 for eq_k, row_r in top_rec.iterrows():
                     report_lines.append(
                         f"  - {eq_k}: {int(row_r['재발건수'])}건 재발, "
-                        f"정지 {row_r['정지시간']:.0f}분 → 근본원인 분析 필요")
+                        f"정지 {row_r['정지시간']:.0f}분 → 근본원인 분석 필요")
 
         # ── 9. 야간 돌발 현황 ─────────────────────────────────
         if '보전구분' in cur_df.columns and '발생일시' in cur_df.columns:
@@ -3440,7 +3496,7 @@ with tab13:
                 f"예방보전 점검주기 단축 검토 필요.")
         if cr >= 3:
             report_lines.append(
-                f"  ② 재발 고장 {cr}건 — 근본원인 분析 및 恒久대책 수립.")
+                f"  ② 재발 고장 {cr}건 — 근본원인 분석 및 근본대책 수립.")
         if '보전구분' in cur_df.columns:
             _bm_pct_final = (cur_df['보전구분']=='BM(돌발)').mean()*100
             if _bm_pct_final >= 80:
@@ -3512,7 +3568,7 @@ with tab14:
     if df is None:
         st.info("Tab1에서 데이터를 불러오고 '통합 실행'을 눌러주세요.")
     else:
-        _print_tab('분析 결과 출력')
+        _print_tab('분석 결과 출력')
         st.subheader("분석 결과 출력")
         oc1,oc2 = st.columns(2)
         with oc1:
@@ -3613,13 +3669,13 @@ with tab14:
                         '.t tr:nth-child(even){background:#f5f8ff;}'
                         '@page{size:A4;margin:15mm;}'
                         '</style></head><body>'
-                        f'<h1>⚙ 보전팀 분析 보고서 — {datetime.now().strftime("%Y-%m-%d %H:%M")} 출력</h1>'
+                        f'<h1>⚙ 보전팀 분석 보고서 — {datetime.now().strftime("%Y-%m-%d %H:%M")} 출력</h1>'
                         f'{body}</body></html>')
             html_full = _make_full_html(df)
             st.download_button(
                 '⬇️ HTML 보고서 다운로드',
                 data=html_full.encode('utf-8'),
-                file_name=f"보전팀_분析보고서_{datetime.now().strftime('%Y%m%d_%H%M')}.html",
+                file_name=f"보전팀_분석보고서_{datetime.now().strftime('%Y%m%d_%H%M')}.html",
                 mime='text/html',
                 use_container_width=True,
                 key='html_full_dl')
