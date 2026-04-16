@@ -1007,7 +1007,7 @@ def calc_mom_delta(df, year, month):
 # 헤더
 # ══════════════════════════════════════════════════════
 st.markdown('<div class="main-title">🔧 보전팀 통합 분석 시스템</div>', unsafe_allow_html=True)
-st.markdown('<div class="sub-title">호원오토 평택공장 | 보전관리 2팀</div>', unsafe_allow_html=True)
+st.markdown('<div class="sub-title">호원오토 평택공장 | 보전관리 2팀 | 정한식 책임</div>', unsafe_allow_html=True)
 
 # ── 🚨 상단 경고 배너 (데이터 로드 후 자동 표시) ──────
 _mdf = st.session_state.merged_df
