@@ -1422,6 +1422,17 @@ def calc_mom_delta(df, year, month):
 # ══════════════════════════════════════════════════════
 st.markdown('<div class="main-title">🔧 보전팀 통합 분석 시스템</div>', unsafe_allow_html=True)
 st.markdown('<div class="sub-title">호원오토 평택공장 | 보전관리 2팀 &nbsp;|&nbsp; 보전팀장 정한식 책임</div>', unsafe_allow_html=True)
+# ── 데이터 갱신/최근 고장일 표시 ──
+_mdf_hdr = st.session_state.get('merged_df')
+if _mdf_hdr is not None:
+    _ts_hdr = st.session_state.get('_snap_ts')
+    _upd_hdr = _ts_hdr.strftime('%Y-%m-%d %H:%M') if _ts_hdr is not None else '-'
+    try:
+        _ld_hdr = _mdf_hdr['발생일시'].max()
+        _last_hdr = _ld_hdr.strftime('%Y-%m-%d') if pd.notna(_ld_hdr) else '-'
+    except Exception:
+        _last_hdr = '-'
+    st.caption(f"📅 데이터 갱신: {_upd_hdr} · 최근 고장일: {_last_hdr}")
 
 # ── 🚨 상단 경고 배너 (데이터 로드 후 자동 표시) ──────
 _mdf = st.session_state.merged_df
