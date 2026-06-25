@@ -422,9 +422,11 @@ def _disk_memo(kind, keep=16, key_filter=None):
             if p:
                 try:
                     os.makedirs(_calc_cache_dir(), exist_ok=True)
-                    with open(p, 'wb') as f:
+                    _tmp = p + f'.tmp{os.getpid()}_{id(res)}'
+                    with open(_tmp, 'wb') as f:
                         pickle.dump(res, f)
-                    fs = [os.path.join(_calc_cache_dir(), x) for x in os.listdir(_calc_cache_dir()) if x.startswith(kind + '_')]
+                    os.replace(_tmp, p)   # 원자적 교체 — 부분쓰기/스레드경쟁 방지
+                    fs = [os.path.join(_calc_cache_dir(), x) for x in os.listdir(_calc_cache_dir()) if x.startswith(kind + '_') and x.endswith('.pkl')]
                     fs.sort(key=lambda x: os.path.getmtime(x))
                     for old in fs[:-keep]:
                         try: os.remove(old)
@@ -1192,6 +1194,9 @@ _GF_DEFAULTS = {
     'gf_start':       None,
     'gf_end':         None,
     'gf_label':       '전체',
+    'gf_gongjeong':   '전체',
+    'gf_cars':        [],
+    'gf_lines':       [],
 }
 for k, v in _GF_DEFAULTS.items():
     if k not in st.session_state:
@@ -1317,6 +1322,9 @@ def _apply_default_filter(merged):
     st.session_state['gf_start'] = None
     st.session_state['gf_end'] = None
     st.session_state['gf_label'] = f"{_yr}년 1~{max(_months)}월"
+    st.session_state['gf_gongjeong'] = '전체'
+    st.session_state['gf_cars'] = []
+    st.session_state['gf_lines'] = []
 
 def _load_registered_sheets(force=False, snapshot_only=False):
     """force=구글 강제. snapshot_only=진입용(저장 데이터만, 구글 fetch 안 함)."""
@@ -1479,25 +1487,30 @@ if _mdf is not None:
 # ══════════════════════════════════════════════════════
 def apply_global_filter(df):
     if df is None: return None
+    out = df
     mode = st.session_state.get('gf_mode', '📅 연도선택')
     if mode == '📅 연도선택':
         yrs = st.session_state.get('gf_years', [])
-        return df[df['년'].isin(yrs)].copy() if yrs else df.copy()
+        if yrs: out = out[out['년'].isin(yrs)]
     elif mode == '📆 월선택':
         yr  = st.session_state.get('gf_year_single')
         mos = st.session_state.get('gf_months', [])
-        if yr and mos:
-            return df[(df['년'] == yr) & (df['월'].isin(mos))].copy()
-        return df.copy()
+        if yr and mos: out = out[(out['년'] == yr) & (out['월'].isin(mos))]
     else:
-        s = st.session_state.get('gf_start')
-        e = st.session_state.get('gf_end')
+        s = st.session_state.get('gf_start'); e = st.session_state.get('gf_end')
         if s and e:
-            return df[
-                (df['발생일시'].dt.date >= s) &
-                (df['발생일시'].dt.date <= e)
-            ].copy()
-        return df.copy()
+            out = out[(out['발생일시'].dt.date >= s) & (out['발생일시'].dt.date <= e)]
+    # ── 공정(파일출처) ──
+    _gj = st.session_state.get('gf_gongjeong', '전체')
+    if _gj == '프레스': out = out[out['파일출처'] == '프레스']
+    elif _gj == '로봇·지그': out = out[out['파일출처'] == '로봇/지그']
+    # ── 차종(복수) ──
+    _cars = st.session_state.get('gf_cars', [])
+    if _cars and '차종' in out.columns: out = out[out['차종'].isin(_cars)]
+    # ── 라인(복수, 차종 연동) ──
+    _lns = st.session_state.get('gf_lines', [])
+    if _lns and '라인' in out.columns: out = out[out['라인'].isin(_lns)]
+    return out.copy()
 
 _mdf_raw = st.session_state.merged_df
 
@@ -1617,6 +1630,34 @@ with st.expander(
                 f"📌 **{st.session_state['gf_label']}**  \n"
                 f"적용: **{_gf_cnt:,}건** "
                 f"({_gf_pct:.1f}% / 전체 {len(_mdf_raw):,}건)")
+
+        # ── 공정 / 차종(복수) / 라인(차종 연동) — 모든 탭 공통 ──
+        _pc1, _pc2, _pc3 = st.columns([2, 4, 3])
+        with _pc1:
+            _gj = st.selectbox(
+                '공정', ['전체', '프레스', '로봇·지그'],
+                index=['전체', '프레스', '로봇·지그'].index(
+                    st.session_state.get('gf_gongjeong', '전체')),
+                key='_gf_gj')
+            st.session_state['gf_gongjeong'] = _gj
+        _gbase = _mdf_raw
+        if _gj == '프레스': _gbase = _gbase[_gbase['파일출처'] == '프레스']
+        elif _gj == '로봇·지그': _gbase = _gbase[_gbase['파일출처'] == '로봇/지그']
+        with _pc2:
+            _car_opts = sorted(_gbase['차종'].dropna().unique().tolist(), key=str) if '차종' in _gbase.columns else []
+            _sel_cars = st.multiselect(
+                '차종 (복수 선택)', _car_opts,
+                default=[c for c in st.session_state.get('gf_cars', []) if c in _car_opts],
+                key='_gf_cars')
+            st.session_state['gf_cars'] = _sel_cars
+        with _pc3:
+            _lbase = _gbase[_gbase['차종'].isin(_sel_cars)] if (_sel_cars and '차종' in _gbase.columns) else _gbase
+            _line_opts = sorted(_lbase['라인'].dropna().unique().tolist(), key=str) if '라인' in _lbase.columns else []
+            _sel_lines = st.multiselect(
+                '라인 (복수·차종 연동)', _line_opts,
+                default=[l for l in st.session_state.get('gf_lines', []) if l in _line_opts],
+                key='_gf_lines')
+            st.session_state['gf_lines'] = _sel_lines
 
 # ── 라디오 메뉴 (선택 탭만 실행 — st.tabs 전체실행 회피) ──
 _PAGES = [
@@ -1833,25 +1874,18 @@ if _page == "📊 고장현황 (Pareto)":
     else:
         _print_tab('고장현황 분석')
         st.subheader("고장현황 분석")
-        fc1,fc2,fc3,fc4,fc5 = st.columns([2,2,2,2,1])
+        fc1, fc4 = st.columns([3, 2])
         with fc1:
             equips = ['전체'] + sorted(df['설비유형'].dropna().unique().tolist(), key=str)
             sel_eq = st.selectbox("설비유형", equips, key='t2e')
-        with fc2:
-            lines = ['전체'] + sorted(df['라인'].dropna().unique().tolist(), key=str)
-            sel_ln = st.selectbox("라인", lines, key='t2l')
-        with fc3:
-            cars = ['전체'] + sorted(df['차종'].dropna().unique().tolist(), key=str) if '차종' in df.columns else ['전체']
-            sel_car = st.selectbox("차종", cars, key='t2car')
         with fc4:
             top_n = st.slider("Top N", 5, 30, 20, key='t2n')
+        st.caption("※ 공정·차종(복수)·라인(연동)은 상단 전역 필터에서 선택")
 
         fdf = apply_global_filter(df)
         if fdf is None or fdf.empty:
-            st.warning(f"선택한 기간({st.session_state.get('gf_label','')})에 데이터가 없습니다.")
+            st.warning(f"선택한 조건({st.session_state.get('gf_label','')})에 데이터가 없습니다.")
         if sel_eq  != '전체': fdf = fdf[fdf['설비유형'] == sel_eq]
-        if sel_ln  != '전체': fdf = fdf[fdf['라인'] == sel_ln]
-        if sel_car != '전체' and '차종' in fdf.columns: fdf = fdf[fdf['차종'] == sel_car]
 
         total_cnt  = len(fdf)
         total_stop = fdf['소요시간'].sum()
@@ -2960,17 +2994,14 @@ if _page == "⏱️ 유실시간 분석":
         st.info("Tab1에서 데이터를 불러오고 '통합 실행'을 눌러주세요.")
     else:
         st.markdown("## ⏱️ 유실시간 분석")
-        lf1,lf2,lf3 = st.columns(3)
+        lf1,lf2 = st.columns([1,2])
         with lf2:
             eq_l = ['전체']+sorted(df['설비유형'].dropna().unique().tolist(),key=str)
             sel_eq_l = st.selectbox("설비유형",eq_l,key='l_eq')
-        with lf3:
-            lc_l = ['전체']+sorted(df['라인_차종'].dropna().unique().tolist(),key=str)
-            sel_lc_l = st.selectbox("차종·라인",lc_l,key='l_lc')
+        st.caption("※ 공정·차종(복수)·라인(연동)은 상단 전역 필터에서 선택")
 
         ldf = apply_global_filter(df)
         if sel_eq_l != '전체': ldf = ldf[ldf['설비유형']==sel_eq_l]
-        if sel_lc_l != '전체': ldf = ldf[ldf['라인_차종']==sel_lc_l]
         ldf_v = ldf[ldf['소요시간'].notna()].copy()
         if len(ldf_v)==0:
             st.warning("필터 조건에 해당하는 소요시간 데이터가 없습니다.")
@@ -3570,8 +3601,8 @@ if _page == "🔁 재발 고장 전용":
         if sel_eq_rc != '전체': rdf = rdf[rdf['설비유형']==sel_eq_rc]
         rdf = rdf[rdf['발생일시'].notna()].sort_values('발생일시').reset_index(drop=True)
 
-        # 재발 재계산 (윈도우 변경 반영)
-        rdf['재발여부'] = calc_recurrence(rdf, win_days)
+        # 재발 재계산 (윈도우 변경 반영) — .values 로 위치기반 할당(인덱스 불일치 면역)
+        rdf['재발여부'] = calc_recurrence(rdf, win_days).values
 
         total_rc = len(rdf)
         recur_cnt = rdf['재발여부'].sum()
@@ -5067,7 +5098,6 @@ def _bg_warm_other_tabs(_dff):
     """다른 탭에서 쓰는 무거운 계산 5종을 현재 필터로 미리 실행 → 캐시."""
     for _fn in (
         lambda d: calc_mttr_mtbf(d, cluster_min=60),   # 설비분석/KPI/월보
-        lambda d: calc_recurrence(d, 90),              # 재발
         lambda d: _gap_analysis(d),                    # 재발간격
         lambda d: _parts_cycle(d),                     # 표준코드(부품교체)
         lambda d: _detect_surge_cached(d),             # 인사이트(급증)
