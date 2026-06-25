@@ -1446,6 +1446,20 @@ if _mdf_hdr is not None:
 # ══════════════════════════════════════════════════════
 # 전역 기간 필터 — 모든 탭 공통 적용
 # ══════════════════════════════════════════════════════
+def _apply_item_filter(out):
+    """전역 품목 필터(공정/차종/라인)만 적용 — 기간 제외. 선택 없으면 전 품목."""
+    # ── 공정(파일출처) ──
+    _gj = st.session_state.get('gf_gongjeong', '전체')
+    if _gj == '프레스': out = out[out['파일출처'] == '프레스']
+    elif _gj == '로봇·지그': out = out[out['파일출처'] == '로봇/지그']
+    # ── 차종(복수) ──
+    _cars = st.session_state.get('gf_cars', [])
+    if _cars and '차종' in out.columns: out = out[out['차종'].isin(_cars)]
+    # ── 라인(복수, 차종 연동) ──
+    _lns = st.session_state.get('gf_lines', [])
+    if _lns and '라인' in out.columns: out = out[out['라인'].isin(_lns)]
+    return out
+
 def apply_global_filter(df):
     if df is None: return None
     out = df
@@ -1461,16 +1475,7 @@ def apply_global_filter(df):
         s = st.session_state.get('gf_start'); e = st.session_state.get('gf_end')
         if s and e:
             out = out[(out['발생일시'].dt.date >= s) & (out['발생일시'].dt.date <= e)]
-    # ── 공정(파일출처) ──
-    _gj = st.session_state.get('gf_gongjeong', '전체')
-    if _gj == '프레스': out = out[out['파일출처'] == '프레스']
-    elif _gj == '로봇·지그': out = out[out['파일출처'] == '로봇/지그']
-    # ── 차종(복수) ──
-    _cars = st.session_state.get('gf_cars', [])
-    if _cars and '차종' in out.columns: out = out[out['차종'].isin(_cars)]
-    # ── 라인(복수, 차종 연동) ──
-    _lns = st.session_state.get('gf_lines', [])
-    if _lns and '라인' in out.columns: out = out[out['라인'].isin(_lns)]
+    out = _apply_item_filter(out)
     return out.copy()
 
 _mdf_raw = st.session_state.merged_df
@@ -3930,6 +3935,17 @@ if _page == "📝 월보·주보 자동작성":
         st.caption("기간을 선택하면 보고서용 요약 문구를 자동 생성합니다")
 
         rep_mode = st.radio("보고서 종류", ["📅 월보", "📆 주보"], horizontal=True, key='rep_mode')
+
+        # 전역 품목(공정/차종/라인) 필터 적용 — 기간은 아래 대상 월/주차로 선택
+        df = _apply_item_filter(df)
+        _rep_scope = []
+        if st.session_state.get('gf_gongjeong', '전체') != '전체':
+            _rep_scope.append(st.session_state['gf_gongjeong'])
+        if st.session_state.get('gf_cars'):
+            _rep_scope.append("차종 " + ", ".join(map(str, st.session_state['gf_cars'])))
+        if st.session_state.get('gf_lines'):
+            _rep_scope.append("라인 " + ", ".join(map(str, st.session_state['gf_lines'])))
+        st.caption("📌 대상 품목: " + (" · ".join(_rep_scope) if _rep_scope else "전 품목"))
 
         df_rep = df[df['발생일시'].notna()].copy()
         df_rep['년']  = df_rep['발생일시'].dt.year
