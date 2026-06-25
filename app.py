@@ -1442,45 +1442,6 @@ if _mdf_hdr is not None:
         _last_hdr = '-'
     st.caption(f"📅 데이터 갱신: {_upd_hdr} · 최근 고장일: {_last_hdr}")
 
-# ── 🚨 상단 경고 배너 (데이터 로드 후 자동 표시) ──────
-_mdf = st.session_state.merged_df
-if _mdf is not None:
-    _warn_items = []
-    # MTTR 60분 이상 설비
-    if '소요시간' in _mdf.columns and '설비_KEY' in _mdf.columns:
-        _mttr_bad = (_mdf.groupby('설비_KEY')['소요시간'].mean()
-                     .reset_index(name='평균MTTR'))
-        _mttr_cnt = (_mttr_bad['평균MTTR'] >= 60).sum()
-        if _mttr_cnt > 0:
-            _warn_items.append(f"🔴 MTTR 60분 이상 설비 **{_mttr_cnt}개**")
-    # 재발률 50% 이상 설비
-    if '재발여부' in _mdf.columns:
-        _eq_r = (_mdf.groupby('설비_KEY')
-                 .agg(전체=('재발여부','count'), 재발=('재발여부','sum'))
-                 .reset_index())
-        _eq_r = _eq_r[_eq_r['전체'] >= 3]
-        if not _eq_r.empty:
-            _eq_r['재발률'] = _eq_r['재발'] / _eq_r['전체'] * 100
-            _danger_cnt = (_eq_r['재발률'] >= 50).sum()
-            if _danger_cnt > 0:
-                _warn_items.append(f"🟠 재발률 50% 이상 설비 **{_danger_cnt}개**")
-    # BM 비율 경고
-    if '보전구분' in _mdf.columns:
-        _bm_pct = (_mdf['보전구분'] == 'BM(돌발)').mean() * 100
-        if _bm_pct >= 80:
-            _warn_items.append(f"⚠️ BM(돌발) 비율 **{_bm_pct:.0f}%** — PM 전환 검토 필요")
-    if _warn_items:
-        _banner = " &nbsp;|&nbsp; ".join(_warn_items)
-        st.markdown(
-            f'<div style="background:#fff3cd;border-left:5px solid #ffc107;'
-            f'padding:10px 18px;border-radius:6px;margin-bottom:10px;font-size:14px;">'
-            f'⚠️ <b>즉시 확인 필요</b> &nbsp;→&nbsp; {_banner}</div>',
-            unsafe_allow_html=True)
-    else:
-        st.markdown(
-            '<div style="background:#d4edda;border-left:5px solid #28a745;'
-            'padding:8px 18px;border-radius:6px;margin-bottom:10px;font-size:13px;">'
-            '✅ 긴급 경고 없음 — 정상 관리 중</div>', unsafe_allow_html=True)
 
 # ══════════════════════════════════════════════════════
 # 전역 기간 필터 — 모든 탭 공통 적용
